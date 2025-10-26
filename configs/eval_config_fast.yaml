@@ -1,0 +1,42 @@
+# Fast evaluation configuration (no visualizations)
+# Use this for quick metric calculation
+
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+weights_path: weights/model5.h5
+
+# Dataset
+data:
+  annotation: data/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+
+# Evaluation parameters
+evaluation:
+  batch_size: 8
+  input_shape: [608, 608, 3]
+  confidence_threshold: 0.001
+  nms_threshold: 0.45
+  use_iol: true
+  
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  interpolation_method: 'coco'
+  
+  metrics:
+    - mAP
+    - mAP50
+    - mAP75
+  
+  optimize_classes: true
+  cache_ious: true
+  use_parallel: true
+  use_tfdata: true
+  mixed_precision: false
+  use_gpu_nms: true
+  
+  save_results: true
+  results_dir: results/evaluation
+
+# Visualization settings - DISABLED for fast evaluation
+visualizations:
+  enabled: false
+

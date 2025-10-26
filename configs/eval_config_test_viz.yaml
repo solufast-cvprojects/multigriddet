@@ -1,0 +1,76 @@
+# Test configuration for visualization testing
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+weights_path: weights/model5.h5
+
+# Dataset
+data:
+  annotation: data/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+
+# Evaluation parameters
+evaluation:
+  batch_size: 2
+  input_shape: [608, 608, 3]
+  confidence_threshold: 0.001
+  nms_threshold: 0.45
+  use_iol: true
+  
+  # IoU thresholds for mAP calculation
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  
+  # Interpolation method
+  interpolation_method: 'coco'
+  
+  # Limit images for quick testing
+  max_images: 50  # Test with only 50 images
+  
+  # Metrics to compute
+  metrics:
+    - mAP
+    - mAP50
+    - mAP75
+  
+  # Performance optimizations
+  optimize_classes: true
+  cache_ious: true
+  use_parallel: true
+  use_tfdata: true
+  mixed_precision: false
+  use_gpu_nms: true
+  
+  # Output
+  save_results: true
+  results_dir: results/evaluation_test
+
+# Visualization settings (ENABLED for testing)
+visualizations:
+  enabled: true  # Enable visualizations
+  
+  # Individual plot controls
+  plots:
+    precision_recall_curves: true
+    confusion_matrix: true
+    per_class_map_bar: true
+    iou_distribution: true
+    confidence_analysis: true
+  
+  # PR curve settings
+  pr_curves:
+    show_per_class: true
+    show_averaged: true
+    top_k: 5  # Only top 5 for quick testing
+    style: 'paper'
+  
+  # Confusion matrix settings
+  confusion_matrix:
+    normalize: true
+    top_k: 10  # Only top 10 for quick testing
+    cmap: 'Blues'
+  
+  # Output settings
+  output:
+    format: 'png'
+    dpi: 150  # Lower DPI for quick testing
+    save_dir: 'results/evaluation_test/plots'
+

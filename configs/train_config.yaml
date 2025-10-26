@@ -1,0 +1,74 @@
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+
+# Dataset paths
+data:
+  train_annotation: data/coco_train2017.txt
+  val_annotation: data/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+  
+# Training parameters
+training:
+  batch_size: 16
+  epochs: 100
+  initial_epoch: 0
+  learning_rate: 0.001
+  
+  # Two-stage training
+  transfer_epochs: 50      # Freeze backbone first
+  freeze_level: 1          # 0=all, 1=backbone, 2=all but head
+  
+  # Loss configuration
+  loss_option: 2           # 1=IoL-MSE, 2=IoL-MSE+mask, 3=GIoU/DIoU
+  label_smoothing: 0.0
+  elim_grid_sense: false
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    enhance_type: null     # 'mosaic', 'gridmask', or null
+    rescale_interval: 10   # Multi-scale training ENABLED - your brilliant solution!
+  
+  # Multi-anchor assignment
+  multi_anchor_assign: false
+  
+# Optimizer
+optimizer:
+  type: adam
+  learning_rate: 0.001
+  decay: 0.0005
+  
+# Learning rate schedule
+lr_schedule:
+  type: reduce_on_plateau
+  factor: 0.5
+  patience: 3
+  min_lr: 1.0e-7
+
+# Callbacks
+callbacks:
+  checkpoint:
+    save_best_only: true
+    monitor: val_loss
+    save_dir: logs/checkpoints
+  tensorboard:
+    log_dir: logs/tensorboard
+  early_stopping:
+    monitor: val_loss
+    patience: 10
+    
+# Resume training
+resume:
+  enabled: false
+  weights_path: null
+  
+# Output
+output:
+  log_dir: logs/training
+  model_dir: trained_models
+  save_frequency: 1  # Save every N epochs
+
+
+
+
+

@@ -1,0 +1,40 @@
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+weights_path: weights/model5.h5
+
+# Input configuration
+input:
+  type: image  # 'image', 'video', 'camera', 'directory'
+  source: examples/images/dog.jpg
+  input_shape: [608, 608, 3]
+
+# Detection parameters
+detection:
+  confidence_threshold: 0.5
+  nms_threshold: 0.45
+  max_boxes: 100
+  use_iol: true           # Use IoL instead of IoU
+  use_cluster_nms: true   # Cluster NMS instead of standard
+  use_diou: true          # DIoU-NMS
+  
+# Output configuration
+output:
+  save_result: true
+  output_dir: output
+  show_result: true
+  draw_boxes: true
+  show_scores: true
+  
+# Video/Camera specific
+video:
+  fps: null              # Auto-detect from source
+  fourcc: mp4v           # Video codec
+  
+camera:
+  device_id: 0
+  resolution: [1280, 720]
+
+
+
+
+

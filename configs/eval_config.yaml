@@ -1,0 +1,81 @@
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+weights_path: weights/model5.h5
+
+# Dataset
+data:
+  annotation: data/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+
+# Evaluation parameters
+evaluation:
+  batch_size: 8
+  input_shape: [608, 608, 3]
+  confidence_threshold: 0.001  # Low threshold for mAP
+  nms_threshold: 0.45
+  use_iol: true
+
+  
+  # IoU thresholds for mAP calculation
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  
+  # Interpolation method: 'coco' or 'voc'
+  interpolation_method: 'coco'
+  
+  # Optional: limit number of images for testing
+  # max_images: 100
+  
+  # Metrics to compute
+  metrics:
+    - mAP              # Mean Average Precision @0.5:0.95 (COCO)
+    - mAP50            # mAP @ IoU 0.5 (VOC)
+    - mAP75            # mAP @ IoU 0.75
+  
+  # Performance optimizations
+  optimize_classes: true      # Skip empty classes (20-30% faster)
+  cache_ious: true            # Cache IoU matrices (50-70% faster)
+  use_parallel: true          # Parallel processing (2-3x faster)
+  use_tfdata: true            # fast loader
+  mixed_precision: false      # if your GPU supports FP16
+  use_gpu_nms: true           # Enable GPU-accelerated NMS for evaluation
+  # Output
+  save_results: true
+  results_dir: results/evaluation
+
+# Visualization settings (Academic paper-quality plots)
+visualizations:
+  enabled: false  # Master switch - set to true to generate plots
+  
+  # Individual plot controls
+  plots:
+    precision_recall_curves: true      # Essential - PR curves per class
+    confusion_matrix: true             # Essential - class confusion heatmap
+    per_class_map_bar: true           # Essential - AP per class bar chart
+    iou_distribution: true             # IoU histogram for localization quality
+    confidence_analysis: true          # Precision/Recall/F1 vs threshold
+    # Note: error_analysis, size_performance, and detection_examples 
+    # require additional implementation
+  
+  # PR curve settings
+  pr_curves:
+    show_per_class: true   # Individual class PR curves
+    show_averaged: true    # Averaged PR curve with multiple classes
+    top_k: 10             # Show only top K classes by AP
+    style: 'paper'        # 'paper' or 'presentation'
+  
+  # Confusion matrix settings
+  confusion_matrix:
+    normalize: true   # Show percentages instead of counts
+    top_k: 20        # Show only top K most frequent classes
+    cmap: 'Blues'    # Color map: 'Blues', 'Reds', 'Greens', 'viridis', etc.
+  
+  # Output settings
+  output:
+    format: 'png'        # 'png', 'pdf', 'svg'
+    dpi: 300            # Publication quality (300 for papers, 150 for quick)
+    save_dir: 'results/evaluation/plots'
+
+
+
+
+

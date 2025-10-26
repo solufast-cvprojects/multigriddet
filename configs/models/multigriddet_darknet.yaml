@@ -1,0 +1,26 @@
+model:
+  name: multigriddet_darknet
+  type: preset  # or 'custom' for advanced composition
+  
+  # Preset mode (simple)
+  preset:
+    architecture: multigriddet_darknet
+    num_classes: 80
+    input_shape: [608, 608, 3]  # Base input shape - multi-scale handled by data generator
+    anchors_path: configs/yolov3_coco_anchor.txt
+    classes_path: configs/coco_classes.txt
+  
+  # Custom mode (advanced, for future use)
+  custom:
+    backbone:
+      type: darknet53
+      freeze_layers: 185
+      pretrained: true
+    neck:
+      type: fpn
+      channels: [128, 256, 512]
+    head:
+      type: multigrid
+      num_anchors: [3, 3, 3]
+      output_channels: 88  # 5 + 3 + 80
+
