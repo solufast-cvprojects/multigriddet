@@ -1,0 +1,57 @@
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+weights_path: weights/model5.h5
+
+# Dataset
+# Dataset
+data:
+  annotation: data/coco_val2017.txt  # Using validation set with max_images limit
+  classes_path: configs/coco_classes.txt
+
+# Evaluation parameters
+evaluation:
+  batch_size: 1
+  input_shape: [608, 608, 3]
+  confidence_threshold: 0.1  # Confidence threshold for detection
+  nms_threshold: 0.45
+  use_iol: true
+  
+  # IoU thresholds for mAP calculation (reduced for test)
+  iou_thresholds: [0.5, 0.75]
+  
+  # Interpolation method: 'coco' or 'voc'
+  interpolation_method: 'coco'
+  
+  # Limit number of images for testing
+  max_images: 3
+  
+  # Metrics to compute
+  metrics:
+    - mAP              # Mean Average Precision @0.5:0.95 (COCO)
+    - mAP50            # mAP @ IoU 0.5 (VOC)
+    - mAP75            # mAP @ IoU 0.75
+  
+  # Performance optimizations
+  optimize_classes: true      # Skip empty classes
+  cache_ious: true           # Cache IoU matrices
+  use_parallel: true        # No parallel for small test
+  use_tfdata: true          # fast loader
+  mixed_precision: false     
+  use_gpu_nms: false        # Disable GPU-accelerated NMS (use CPU/numpy path)
+  
+  # Output
+  save_results: true
+  results_dir: results/evaluation_test
+
+# Visualization settings
+visualizations:
+  enabled: false
+  
+  # Save annotated images during evaluation (for debugging/verification)
+  save_annotated_images:
+    enabled: true   # ENABLED for testing - set to false for normal evaluation
+    save_dir: results/evaluation_test/annotated_images
+    draw_predictions: true   # Draw predicted bounding boxes
+    draw_ground_truth: true  # Draw ground truth bounding boxes (for comparison)
+    max_images: 5           # Save first 5 images to verify box coordinates
+    image_format: 'jpg'     # 'jpg' or 'png'

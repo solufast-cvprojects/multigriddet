@@ -10,13 +10,13 @@ import numpy as np
 from typing import List, Tuple, Union
 
 
-def denseyolo2_decode_tf(predictions: List[tf.Tensor], 
+def multigriddet_decode_tf(predictions: List[tf.Tensor], 
                          anchors: List[np.ndarray], 
                          num_classes: int, 
                          input_dims: Tuple[int, int],
                          rescore_confidence: bool = True) -> tf.Tensor:
     """
-    TensorFlow GPU version of denseyolo2_decode.
+    TensorFlow GPU version of multigriddet_decode.
     
     Args:
         predictions: List of TF tensors (batch, grid_h, grid_w, anchors*(5+classes))
@@ -91,7 +91,8 @@ def denseyolo2_decode_tf(predictions: List[tf.Tensor],
         # Rescore confidence if requested
         if rescore_confidence:
             max_anchor_probs = tf.reduce_max(anchor_probs, axis=-1, keepdims=True)
-            class_probs = objectness_probs * max_anchor_probs * class_probs
+            max_class_probs = tf.reduce_max(class_probs, axis=-1, keepdims=True)
+            objectness_probs = objectness_probs * max_anchor_probs * max_class_probs
         
         # Concatenate all components
         prediction_concat = tf.concat([box_xy, box_wh, objectness_probs, class_probs], axis=-1)
@@ -219,7 +220,7 @@ def gpu_nms_boxes(boxes: tf.Tensor,
     return nmsed_boxes_xyxy, nmsed_scores, nmsed_classes, valid_detections
 
 
-def denseyolo2_postprocess_gpu(yolo_outputs: List[tf.Tensor], 
+def multigriddet_postprocess_gpu(multigriddet_outputs: List[tf.Tensor], 
                                image_shapes: tf.Tensor, 
                                anchors: List[np.ndarray], 
                                num_classes: int,
@@ -233,7 +234,7 @@ def denseyolo2_postprocess_gpu(yolo_outputs: List[tf.Tensor],
     GPU-accelerated postprocessing for batched evaluation.
     
     Args:
-        yolo_outputs: List of TensorFlow tensors (batch, grid_h, grid_w, anchors*(5+classes))
+        multigriddet_outputs: List of TensorFlow tensors (batch, grid_h, grid_w, anchors*(5+classes))
         image_shapes: (batch, 2) original image shapes (height, width)
         anchors: List of anchor arrays for each scale
         num_classes: Number of object classes
@@ -250,7 +251,7 @@ def denseyolo2_postprocess_gpu(yolo_outputs: List[tf.Tensor],
         valid_detections: (batch,) number of valid boxes per image
     """
     # 1. Decode predictions on GPU
-    predictions = denseyolo2_decode_tf(yolo_outputs, anchors, num_classes, model_image_size, rescore_confidence)
+    predictions = multigriddet_decode_tf(multigriddet_outputs, anchors, num_classes, model_image_size, rescore_confidence)
     
     # 2. Correct boxes from model space to image space
     predictions = correct_boxes_tf(predictions, image_shapes, model_image_size)
@@ -261,8 +262,9 @@ def denseyolo2_postprocess_gpu(yolo_outputs: List[tf.Tensor],
     class_probs = predictions[..., 5:]  # (batch, num_boxes, num_classes)
     
     # 4. Apply confidence threshold
-    max_class_scores = tf.reduce_max(class_probs, axis=-1, keepdims=True)  # (batch, num_boxes, 1)
-    combined_scores = objectness * max_class_scores  # (batch, num_boxes, 1)
+    # objectness is already rescaled in decode if rescore_confidence=True
+    # So we can use it directly for confidence filtering
+    combined_scores = objectness  # (batch, num_boxes, 1)
     
     # Filter by confidence threshold
     confidence_mask = combined_scores >= confidence

@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 MultiGridDet Camera Inference Example
-Real-time object detection using camera feed.
+Real-time object detection using camera feed with config file.
 """
 
 import os
 import sys
+import argparse
 import cv2
 import numpy as np
 import tensorflow as tf
@@ -18,10 +19,10 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 # Import from multigriddet package
-from multigriddet.models import build_multigriddet_darknet
+from multigriddet.config import ConfigLoader, build_model_for_inference
 from multigriddet.utils.anchors import load_anchors, load_classes
 from multigriddet.utils.tf_optimization import optimize_tf_gpu
-from multigriddet.postprocess.denseyolo_postprocess import denseyolo2_postprocess_np
+from multigriddet.postprocess.multigrid_decode import MultiGridDecoder
 from multigriddet.utils.preprocessing import preprocess_image
 from multigriddet.utils.visualization import get_colors, draw_boxes
 
@@ -29,16 +30,98 @@ from multigriddet.utils.visualization import get_colors, draw_boxes
 def main():
     """Run MultiGridDet camera inference example."""
     
-    print("MultiGridDet Camera Inference Example")
-    print("=" * 40)
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='MultiGridDet Camera Inference Example')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/infer_config.yaml',
+        help='Path to inference config file'
+    )
+    parser.add_argument(
+        '--weights',
+        type=str,
+        default=None,
+        help='Model weights path (overrides config)'
+    )
+    parser.add_argument(
+        '--camera-id',
+        type=int,
+        default=None,
+        help='Camera device ID (overrides config)'
+    )
+    args = parser.parse_args()
     
-    # Configuration
-    weights_path = 'weights/model5.h5'
-    anchors_path = 'configs/yolov3_coco_anchor.txt'
-    classes_path = 'configs/coco_classes.txt'
-    input_shape = (608, 608, 3)  # 608x608 for 80-class COCO
-    confidence_threshold = 0.5
-    nms_threshold = 0.4
+    print("MultiGridDet Camera Inference Example")
+    print("=" * 60)
+    print(f"Config file: {args.config}")
+    
+    # Load configuration
+    try:
+        config = ConfigLoader.load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Config file not found: {args.config}")
+        print(f"   {e}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Error loading config: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Get weights path
+    weights_path = None
+    if args.weights:
+        weights_path = args.weights
+        config['weights_path'] = weights_path
+        print(f"   Weights: {weights_path} (from command line)")
+    else:
+        weights_path = config.get('weights_path')
+        if weights_path:
+            print(f"   Weights: {weights_path} (from config)")
+        else:
+            print("[ERROR] weights_path not specified in config")
+            return False
+    
+    # Get camera ID
+    camera_id = args.camera_id if args.camera_id is not None else config.get('camera', {}).get('device_id', 0)
+    print(f"   Camera ID: {camera_id}")
+    
+    # Get configuration values
+    model_config_path = config.get('model_config')
+    if not model_config_path:
+        print("[ERROR] model_config not specified in config")
+        return False
+    
+    # Load model configuration
+    model_config = ConfigLoader.load_config(model_config_path)
+    
+    # Merge configs
+    full_config = ConfigLoader.merge_configs(model_config, config)
+    
+    # Get paths and parameters
+    anchors_path = model_config['model']['preset']['anchors_path']
+    classes_path = model_config['model']['preset'].get('classes_path')
+    if not classes_path:
+        classes_path = full_config.get('data', {}).get('classes_path')
+    
+    if not classes_path:
+        print("[ERROR] classes_path not found in config")
+        return False
+    
+    input_shape = tuple(model_config['model']['preset'].get('input_shape', [608, 608, 3]))
+    detection_config = config.get('detection', {})
+    confidence_threshold = detection_config.get('confidence_threshold', 0.5)
+    nms_threshold = detection_config.get('nms_threshold', 0.45)
+    nms_method = detection_config.get('nms_method', 'diou')
+    use_wbf = detection_config.get('use_wbf', False)
+    use_iol = detection_config.get('use_iol', True)
+    max_boxes = detection_config.get('max_boxes', 100)
+    
+    camera_config = config.get('camera', {})
+    resolution = camera_config.get('resolution', [640, 480])
+    
+    print()
     
     # Optimize TensorFlow
     optimize_tf_gpu()
@@ -49,55 +132,45 @@ def main():
     anchors = load_anchors(anchors_path)
     colors = get_colors(len(class_names))
     
-    print(f"Loaded {len(class_names)} classes")
-    print(f"Loaded {len(anchors)} anchor sets")
-    print(f"Input shape: {input_shape}")
+    print(f"   Classes: {len(class_names)}")
+    print(f"   Anchors: {len(anchors)} scales")
+    print(f"   Input shape: {input_shape}")
     
-    # Create multigriddet_darknet model
-    print("Creating multigriddet_darknet model...")
-    num_anchors_per_head = [len(anchors[l]) for l in range(len(anchors))]
-    num_classes = len(class_names)
-    
-    model, backbone_len = build_multigriddet_darknet(
-        input_shape=input_shape,
-        num_anchors_per_head=num_anchors_per_head,
-        num_classes=num_classes,
-        weights_path=None  # We'll load weights separately
+    # Initialize decoder
+    decoder = MultiGridDecoder(
+        anchors=anchors,
+        num_classes=len(class_names),
+        input_shape=input_shape[:2],
+        rescore_confidence=True
     )
     
-    print(f"Model created with {model.count_params()} parameters")
-    print(f"Backbone length: {backbone_len}")
+    # Build model using config
+    print("Building model...")
+    model = build_model_for_inference(full_config, weights_path)
     
-    # Load weights from model5.h5
-    print(f"Loading weights from {weights_path}...")
-    if os.path.exists(weights_path):
-        model.load_weights(weights_path)
-        print("[OK] Weights loaded successfully!")
-    else:
-        print(f"[ERROR] Weights file not found: {weights_path}")
-        print("Please download model5.h5 and place it in the weights/ directory")
-        return False
+    print(f"   Model parameters: {model.count_params():,}")
+    print()
     
     # Initialize camera
-    print("Initializing camera...")
-    cap = cv2.VideoCapture(0)  # Use camera 0
+    print(f"Initializing camera (ID: {camera_id})...")
+    cap = cv2.VideoCapture(camera_id)
     
     if not cap.isOpened():
-        print("Error: Could not open camera")
+        print(f"[ERROR] Could not open camera: {camera_id}")
         return False
     
     # Set camera properties
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
     cap.set(cv2.CAP_PROP_FPS, 30)
     
-    print("Camera initialized. Press 'q' to quit, 's' to save current frame")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
     
-    # Video writer for output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('examples/camera_inference_output.mp4', fourcc, 20.0, (640, 480))
-    
-    frame_count = 0
+    print(f"   Camera resolution: {width}x{height} @ {fps} FPS")
+    print("Press 'q' to quit")
+    print()
     
     try:
         while True:
@@ -106,84 +179,66 @@ def main():
                 print("Error: Could not read frame from camera")
                 break
             
-            frame_count += 1
-            
-            # Skip frames for performance (process every 3rd frame)
-            if frame_count % 3 != 0:
-                out.write(frame)
-                continue
-            
             # Convert BGR to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame_rgb)
             
-            # Preprocess image
-            image_data = preprocess_image(pil_image, input_shape[:2])  # (608, 608)
-            image_shape = tuple(reversed(pil_image.size))  # (width, height)
+            # Preprocess
+            image_data = preprocess_image(image, input_shape[:2])
+            image_shape = (height, width)
             
             # Run inference
             predictions = model.predict(image_data, verbose=0)
             
-            # Post-process predictions
-            boxes, classes, scores = denseyolo2_postprocess_np(
-                predictions, 
-                image_shape, 
-                anchors, 
-                num_classes, 
-                input_shape[:2],  # (608, 608)
-                max_boxes=100, 
-                confidence=confidence_threshold, 
-                rescore_confidence=True, 
-                nms_threshold=nms_threshold, 
-                use_iol=True
+            # Post-process
+            boxes, classes, scores = decoder.postprocess(
+                predictions,
+                image_shape,
+                input_shape[:2],
+                max_boxes=max_boxes,
+                confidence=confidence_threshold,
+                nms_threshold=nms_threshold,
+                nms_method=nms_method,
+                use_wbf=use_wbf,
+                use_iol=use_iol,
+                return_xyxy=True
             )
             
-            # Draw bounding boxes
+            # Draw boxes
+            frame_rgb = np.array(image, dtype='uint8')
+            annotated_frame = draw_boxes(
+                frame_rgb,
+                boxes,
+                classes,
+                scores,
+                class_names,
+                colors
+            )
+            
+            # Convert back to BGR for OpenCV display
+            annotated_frame_bgr = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+            
+            # Display
+            cv2.imshow('MultiGridDet Camera Inference', annotated_frame_bgr)
+            
+            # Show detection info
             if len(boxes) > 0:
-                annotated_frame = draw_boxes(
-                    rgb_frame, 
-                    boxes, 
-                    classes, 
-                    scores, 
-                    class_names, 
-                    colors
-                )
-                # Convert back to BGR for OpenCV
-                frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                info_text = f"Detections: {len(boxes)}"
+                cv2.putText(annotated_frame_bgr, info_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
-            # Add FPS counter and model info
-            fps_text = f"MultiGridDet - Frame: {frame_count}, Objects: {len(boxes)}"
-            cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Add model info
-            model_text = f"Model: multigriddet_darknet (44.9M params)"
-            cv2.putText(frame, model_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-            
-            # Display frame
-            cv2.imshow('MultiGridDet Camera Inference', frame)
-            out.write(frame)
-            
-            # Handle key presses
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            # Check for quit
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-            elif key == ord('s'):
-                # Save current frame
-                save_path = f'examples/camera_frame_{frame_count}.jpg'
-                cv2.imwrite(save_path, frame)
-                print(f"Frame saved to: {save_path}")
     
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    
+        print("\n[WARNING] Interrupted by user")
     finally:
-        # Cleanup
         cap.release()
-        out.release()
         cv2.destroyAllWindows()
-        print(f"MultiGridDet camera inference completed. Output saved to: examples/camera_inference_output.mp4")
-        print(f"Total frames processed: {frame_count}")
-        return True
+        print("[OK] Camera inference completed!")
+    
+    return True
 
 
 if __name__ == '__main__':
@@ -192,8 +247,3 @@ if __name__ == '__main__':
         print("\n[SUCCESS] MultiGridDet camera inference is working!")
     else:
         print("\n[ERROR] MultiGridDet camera inference example failed.")
-
-
-
-
-

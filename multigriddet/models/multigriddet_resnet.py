@@ -48,7 +48,7 @@ def build_multigriddet_resnet(input_shape: Tuple[int, int, int] = (416, 416, 3),
     # Get the input from the backbone model
     inputs = backbone_model.input
     
-    # Extract feature maps at specific layers (matching denseyolo2_darknet53.py)
+    # Extract feature maps at specific layers
     # f1: 13x13x1024 (output), f2: 26x26x512 (layer 152), f3: 52x52x256 (layer 92)
     f1 = backbone_model.output  # 13x13x1024
     f2 = backbone_model.layers[152].output  # 26x26x512  
@@ -56,9 +56,9 @@ def build_multigriddet_resnet(input_shape: Tuple[int, int, int] = (416, 416, 3),
     
     # 3. Build neck (FPN) - pass in order f1, f2, f3 (largest to smallest)
     neck_config = {
-        'f1_channel_num': 512,  # From denseyolo2_predictions
-        'f2_channel_num': 256,  # From denseyolo2_predictions
-        'f3_channel_num': 128,  # From denseyolo2_predictions
+        'f1_channel_num': 512,  # From multigriddet_predictions
+        'f2_channel_num': 256,  # From multigriddet_predictions
+        'f3_channel_num': 128,  # From multigriddet_predictions
         'upsample_method': 'upsampling2d',
         'fusion_method': 'concatenate'
     }
@@ -109,7 +109,7 @@ def build_multigriddet_resnet_train(anchors: List[np.ndarray],
     """
     Build training model with loss.
     
-    This replaces get_denseyolo2_train_model() for multigriddet_resnet.
+    MultiGridDet ResNet implementation for training.
     
     Args:
         anchors: List of anchor arrays for each scale

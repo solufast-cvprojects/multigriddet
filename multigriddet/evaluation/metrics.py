@@ -8,6 +8,7 @@ Implements mAP calculation with custom implementation (no pycocotools dependency
 import numpy as np
 from typing import List, Dict, Tuple, Any
 from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
 from ..utils.boxes import BoxUtils
 
 
@@ -519,6 +520,8 @@ def calculate_map(predictions: List[Dict],
     class_aps = {}
     iou_aps = {iou: [] for iou in iou_thresholds}
     
+    total_tasks = len(active_classes) * len(iou_thresholds)
+    
     if use_parallel and len(active_classes) > 1:
         # Parallel processing for multiple classes
         print(f"🚀 Using parallel processing with {min(cpu_count(), len(active_classes))} cores...")
@@ -544,8 +547,14 @@ def calculate_map(predictions: List[Dict],
                     tasks.append((predictions, ground_truths, class_id, iou_threshold, iou_caches[class_id], method))
             
             # Process in parallel with cached IoU
+            print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
             with Pool(processes=min(cpu_count(), len(tasks))) as pool:
-                ap_results = pool.map(_calculate_ap_worker_cached, tasks)
+                ap_results = list(tqdm(
+                    pool.imap(_calculate_ap_worker_cached, tasks),
+                    total=len(tasks),
+                    desc="   Computing AP",
+                    unit="task"
+                ))
         else:
             # Parallel processing without caching (faster for large datasets)
             print("⚡ Using optimized parallel processing (no IoU caching)...")
@@ -555,8 +564,14 @@ def calculate_map(predictions: List[Dict],
                     tasks.append((predictions, ground_truths, class_id, iou_threshold, method))
             
             # Process in parallel
+            print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
             with Pool(processes=min(cpu_count(), len(tasks))) as pool:
-                ap_results = pool.map(_calculate_ap_worker, tasks)
+                ap_results = list(tqdm(
+                    pool.imap(_calculate_ap_worker, tasks),
+                    total=len(tasks),
+                    desc="   Computing AP",
+                    unit="task"
+                ))
         
         # Organize results
         result_idx = 0
@@ -576,13 +591,15 @@ def calculate_map(predictions: List[Dict],
             class_aps[class_name] = class_ap_results
     else:
         # Sequential processing (fallback or single class)
-        for class_id in active_classes:
+        print(f"   Processing {len(active_classes)} classes sequentially...")
+        class_pbar = tqdm(active_classes, desc="   Classes", unit="class")
+        for class_id in class_pbar:
             class_name = class_names[class_id] if class_id < len(class_names) else f'class_{class_id}'
+            class_pbar.set_postfix({"current": class_name})
             class_ap_results = {}
             
             if cache_ious:
                 # Compute IoU cache once per class
-                print(f"🔄 Computing IoU cache for class {class_id}...")
                 iou_cache = compute_iou_cache_for_class(predictions, ground_truths, class_id)
                 
                 # Reuse cache for all IoU thresholds

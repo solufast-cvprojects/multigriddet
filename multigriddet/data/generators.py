@@ -18,6 +18,7 @@ import tensorflow as tf
 from tensorflow.keras.utils import Sequence
 from typing import Tuple, List, Optional, Dict, Any
 import functools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import utility functions from local modules
 from .augmentation import (
@@ -205,6 +206,9 @@ class MultiGridDataGenerator(Sequence):
         
         # Pre-compute anchor masks
         self.anchor_masks = self._compute_anchor_masks()
+        
+        # Setup thread pool for parallel image loading
+        self._executor = ThreadPoolExecutor(max_workers=max(1, num_workers)) if num_workers > 0 else None
     
     def _compute_anchor_masks(self) -> List[np.ndarray]:
         """Pre-compute anchor masks for each layer."""
@@ -219,6 +223,19 @@ class MultiGridDataGenerator(Sequence):
             index = index + num
         
         return anchor_mask_per_scale
+    
+    def _load_and_preprocess_single(self, annotation_line: str, target_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load and preprocess a single image (used for parallel processing).
+        
+        Args:
+            annotation_line: Annotation line string
+            target_shape: Target shape (height, width)
+            
+        Returns:
+            Tuple of (image_array, box_array)
+        """
+        return get_ground_truth_data(annotation_line, target_shape, augment=self.augment)
     
     def __len__(self):
         """Return number of batches per epoch."""
@@ -238,21 +255,65 @@ class MultiGridDataGenerator(Sequence):
         batch_indexs = self.indexes[index * self.batch_size: (index + 1) * self.batch_size]
         batch_annotation_lines = [self.annotation_lines[i] for i in batch_indexs]
 
-        image_data = []
-        box_data = []
-        for b in range(len(batch_annotation_lines)):
-            # Use target shape for preprocessing (multi-scale effect)
-            image, _boxes = get_ground_truth_data(batch_annotation_lines[b], current_target_shape, augment=self.augment)
-            # Resize to model's expected input shape
-            if current_target_shape != self.input_shape:
-                image = cv2.resize(image, (self.input_shape[1], self.input_shape[0]))
-                # Scale boxes accordingly
-                scale_x = self.input_shape[1] / current_target_shape[1]
-                scale_y = self.input_shape[0] / current_target_shape[0]
-                _boxes[:, [0, 2]] = (_boxes[:, [0, 2]] * scale_x).astype('float32')  # x coordinates
-                _boxes[:, [1, 3]] = (_boxes[:, [1, 3]] * scale_y).astype('float32')  # y coordinates
-            image_data.append(image)
-            box_data.append(_boxes)
+        # Parallel image loading for better performance
+        if self._executor and len(batch_annotation_lines) > 1:
+            # Use thread pool for parallel loading
+            futures = {}
+            for b, annotation_line in enumerate(batch_annotation_lines):
+                future = self._executor.submit(
+                    self._load_and_preprocess_single,
+                    annotation_line,
+                    current_target_shape
+                )
+                futures[future] = b
+            
+            # Collect results in order
+            image_data = [None] * len(batch_annotation_lines)
+            box_data = [None] * len(batch_annotation_lines)
+            
+            for future in as_completed(futures):
+                b = futures[future]
+                try:
+                    image, _boxes = future.result()
+                    # Resize to model's expected input shape if needed
+                    if current_target_shape != self.input_shape:
+                        image = cv2.resize(image, (self.input_shape[1], self.input_shape[0]))
+                        # Scale boxes accordingly
+                        scale_x = self.input_shape[1] / current_target_shape[1]
+                        scale_y = self.input_shape[0] / current_target_shape[0]
+                        _boxes[:, [0, 2]] = (_boxes[:, [0, 2]] * scale_x).astype('float32')
+                        _boxes[:, [1, 3]] = (_boxes[:, [1, 3]] * scale_y).astype('float32')
+                    image_data[b] = image
+                    box_data[b] = _boxes
+                except Exception as e:
+                    # Fallback to sequential on error
+                    print(f"Warning: Parallel loading failed for item {b}, falling back to sequential: {e}")
+                    image, _boxes = get_ground_truth_data(batch_annotation_lines[b], current_target_shape, augment=self.augment)
+                    if current_target_shape != self.input_shape:
+                        image = cv2.resize(image, (self.input_shape[1], self.input_shape[0]))
+                        scale_x = self.input_shape[1] / current_target_shape[1]
+                        scale_y = self.input_shape[0] / current_target_shape[0]
+                        _boxes[:, [0, 2]] = (_boxes[:, [0, 2]] * scale_x).astype('float32')
+                        _boxes[:, [1, 3]] = (_boxes[:, [1, 3]] * scale_y).astype('float32')
+                    image_data[b] = image
+                    box_data[b] = _boxes
+        else:
+            # Sequential loading (fallback or when num_workers=0)
+            image_data = []
+            box_data = []
+            for b in range(len(batch_annotation_lines)):
+                # Use target shape for preprocessing (multi-scale effect)
+                image, _boxes = get_ground_truth_data(batch_annotation_lines[b], current_target_shape, augment=self.augment)
+                # Resize to model's expected input shape
+                if current_target_shape != self.input_shape:
+                    image = cv2.resize(image, (self.input_shape[1], self.input_shape[0]))
+                    # Scale boxes accordingly
+                    scale_x = self.input_shape[1] / current_target_shape[1]
+                    scale_y = self.input_shape[0] / current_target_shape[0]
+                    _boxes[:, [0, 2]] = (_boxes[:, [0, 2]] * scale_x).astype('float32')  # x coordinates
+                    _boxes[:, [1, 3]] = (_boxes[:, [1, 3]] * scale_y).astype('float32')  # y coordinates
+                image_data.append(image)
+                box_data.append(_boxes)
         image_data = np.array(image_data)
         max_boxes_per_img = 0
         for boxes in box_data:
@@ -273,65 +334,28 @@ class MultiGridDataGenerator(Sequence):
         """Called at the end of each epoch."""
         if self.shuffle:
             np.random.shuffle(self.annotation_lines)
+    
+    def __del__(self):
+        """Cleanup thread pool on deletion."""
+        if hasattr(self, '_executor') and self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
-def create_tf_dataset_generator(annotation_lines: List[str],
-                               batch_size: int,
-                               input_shape: Tuple[int, int],
-                               anchors: List[np.ndarray],
-                               num_classes: int,
-                               augment: bool = True,
-                               enhance_augment: Optional[str] = None,
-                               rescale_interval: int = -1,
-                               multi_anchor_assign: bool = False,
-                               **kwargs) -> tf.data.Dataset:
+# Helper functions used by MultiGridDataGenerator
+def get_ground_truth_data(annotation_line, input_shape, augment=False, max_boxes=100):
     """
-    Create a TensorFlow dataset generator for MultiGridDet.
+    Load and preprocess ground truth data from annotation line.
     
     Args:
-        annotation_lines: List of annotation file paths
-        batch_size: Batch size for training
-        input_shape: Input image shape (height, width)
-        anchors: List of anchor arrays for each detection layer
-        num_classes: Number of object classes
-        augment: Whether to apply data augmentation
-        enhance_augment: Type of enhanced augmentation
-        rescale_interval: Interval for multi-scale training
-        multi_anchor_assign: Whether to assign multiple anchors per object
+        annotation_line: Annotation line in format "image_path x1,y1,x2,y2,class ..."
+        input_shape: Target image shape (height, width)
+        augment: Whether to apply augmentation
+        max_boxes: Maximum number of boxes (currently unused)
         
     Returns:
-        TensorFlow dataset
+        Tuple of (image_data, box_data) where image_data is normalized image array
+        and box_data is array of boxes in format (x1, y1, x2, y2, class)
     """
-    if not annotation_lines or batch_size <= 0:
-        return None
-    
-    # Create dataset from annotation lines
-    dataset = tf.data.Dataset.from_tensor_slices(annotation_lines)
-    
-    # Shuffle
-    dataset = dataset.shuffle(buffer_size=len(annotation_lines))
-    
-    # Batch
-    dataset = dataset.batch(batch_size)
-    
-    # Map preprocessing function
-    dataset = dataset.map(
-        lambda x: _preprocess_batch_wrapper(
-            x, input_shape, anchors, num_classes, augment, 
-            enhance_augment, multi_anchor_assign
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    
-    # Prefetch
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
-
-
-# Legacy compatibility functions
-def get_ground_truth_data(annotation_line, input_shape, augment=False, max_boxes=100):
-    """Legacy function for backward compatibility."""
     # Implementation remains the same as original
     line = annotation_line.split()
     image = Image.open(line[0])
@@ -349,21 +373,20 @@ def get_ground_truth_data(annotation_line, input_shape, augment=False, max_boxes
     return custom_aug(image, boxes, image_size, model_input_size)
 
 
-def use_imgaug(image, boxes, image_size, model_input_size):
-    """Legacy function for backward compatibility."""
-    new_image, padding_size, offset = letterbox_resize(image, target_size=model_input_size, return_padding_info=True)
-    image = np.array(new_image)
-    boxes = reshape_boxes(boxes, src_shape=image_size, target_shape=model_input_size, padding_shape=padding_size, offset=offset)
-    seq = augmenter_defn_advncd()
-    image, boxes = augment_image(image, boxes, seq)
-    boxes = np.array(boxes).reshape(-1, 5)
-    image_data = np.array(image)
-    image_data = normalize_image(image_data)
-    return image_data, boxes
-
-
 def custom_aug(image, boxes, image_size, model_input_size):
-    """Legacy function for backward compatibility."""
+    """
+    Apply custom augmentation pipeline to image and boxes.
+    
+    Args:
+        image: PIL Image object
+        boxes: Array of boxes in format (x1, y1, x2, y2, class)
+        image_size: Original image size (width, height)
+        model_input_size: Target image size (width, height)
+        
+    Returns:
+        Tuple of (image_data, box_data) where image_data is normalized image array
+        and box_data is array of augmented boxes
+    """
     image, padding_size, padding_offset = random_resize_crop_pad(image, target_size=model_input_size)
     image, horizontal_flip = random_horizontal_flip(image)
     image = random_brightness(image)
@@ -381,9 +404,9 @@ def custom_aug(image, boxes, image_size, model_input_size):
     return image_data, box_data
 
 
-# Keep original functions for compatibility
+# Helper functions for anchor matching
 def get_anchor_mask(anchors):
-    """Original function for backward compatibility."""
+    """Compute anchor mask for each scale."""
     num_anchors_per_scale = [len(anchor) for anchor in anchors]
     total_num_anchors = sum(num_anchors_per_scale)
     anchor_mask = list(range(0, total_num_anchors, 1))
@@ -396,7 +419,7 @@ def get_anchor_mask(anchors):
 
 
 def iol_common_center(anchors, obj_boxes_wh):
-    """Original function for backward compatibility."""
+    """Calculate IoL (Intersection over Largest) scores between anchors and object boxes."""
     intersection_wh = np.minimum(np.expand_dims(obj_boxes_wh, axis=-2), anchors)
     obj_areas = obj_boxes_wh[..., 0] * obj_boxes_wh[..., 1]
     anchor_areas = anchors[:, 0] * anchors[:, 1]
@@ -407,7 +430,7 @@ def iol_common_center(anchors, obj_boxes_wh):
 
 
 def best_fit_anchor(box, anchors):
-    """Original function for backward compatibility."""
+    """Find the best matching anchor for a given box."""
     all_layer_anchors = np.concatenate(anchors, axis=0)   
     anchor_masks = get_anchor_mask(anchors)
     iols = np.round(iol_common_center(all_layer_anchors, box), 3)
@@ -424,7 +447,18 @@ def best_fit_anchor(box, anchors):
 
 
 def best_fit_and_layer(box, anchors, multi_anchor_assign=False, multi_anchor_thresh=0.8):
-    """Original function for backward compatibility."""
+    """
+    Find best matching anchor and layer for a box.
+    
+    Args:
+        box: Box width and height (w, h)
+        anchors: List of anchor arrays for each layer
+        multi_anchor_assign: Whether to assign multiple anchors
+        multi_anchor_thresh: Threshold for multi-anchor assignment
+        
+    Returns:
+        Tuple of (layer, anchor_index, iol_scores) or (layers, anchor_indices, iol_scores) if multi_anchor_assign
+    """
     all_layer_anchors = np.concatenate(anchors, axis=0)   
     anchor_masks = get_anchor_mask(anchors)
     iols = np.round(iol_common_center(all_layer_anchors, box), 3)
@@ -446,7 +480,21 @@ def best_fit_and_layer(box, anchors, multi_anchor_assign=False, multi_anchor_thr
 
 
 def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes, multi_anchor_assign, grid_shapes=None, iou_thresh=0.2):
-    """Original function for backward compatibility."""
+    """
+    Preprocess true boxes into MultiGridDet target format.
+    
+    Args:
+        true_boxes: Batch of boxes in format (x1, y1, x2, y2, class)
+        input_shape: Input image shape (height, width)
+        anchors: List of anchor arrays for each layer
+        num_classes: Number of object classes
+        multi_anchor_assign: Whether to assign multiple anchors per object
+        grid_shapes: Pre-computed grid shapes for each layer (optional)
+        iou_thresh: IoU threshold (currently unused)
+        
+    Returns:
+        List of target tensors for each detection layer
+    """
     assert (true_boxes[..., 4] < num_classes).all(), 'class id must be less than num_classes'
     num_layers = len(anchors)
 
@@ -512,110 +560,3 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes, multi_a
                         assigned_grid_cells.append((kii, kjj))
                         count_grid_cell += 1                            
     return y_true
-
-
-class MultiGridDataGeneratorLegacy(Sequence):
-    """Original data generator for backward compatibility."""
-    
-    def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, augment, enhance_augment=None,
-                 rescale_interval=10, multi_anchor_assign=False, shuffle=True, **kwargs):
-        self.annotation_lines = annotation_lines
-        self.batch_size = batch_size
-        self.input_shape = input_shape
-        self.anchors = anchors
-        self.num_classes = num_classes
-        self.enhance_augment = enhance_augment
-        self.augment = augment
-        self.multi_anchor_assign = multi_anchor_assign
-        self.indexes = np.arange(len(self.annotation_lines))
-        self.shuffle = shuffle
-        self.rescale_interval = rescale_interval
-        self.rescale_step = 0
-        self.input_shape_list = get_multiscale_list()
-
-    def __len__(self):
-        return max(1, math.ceil(len(self.annotation_lines) / float(self.batch_size)))
-
-    def __getitem__(self, index):
-        batch_indexs = self.indexes[index * self.batch_size: (index + 1) * self.batch_size]
-        batch_annotation_lines = [self.annotation_lines[i] for i in batch_indexs]
-
-        if self.rescale_interval > 0:
-            self.rescale_step = (self.rescale_step + 1) % self.rescale_interval
-            if self.rescale_step == 0:
-                self.input_shape = self.input_shape_list[random.randint(0, len(self.input_shape_list) - 1)]
-
-        image_data = []
-        box_data = []
-        for b in range(len(batch_annotation_lines)):
-            image, _boxes = get_ground_truth_data(batch_annotation_lines[b], self.input_shape, augment=self.augment)
-            image_data.append(image)
-            box_data.append(_boxes)
-        image_data = np.array(image_data)
-        max_boxes_per_img = 0
-        for boxes in box_data:
-            if len(boxes) > max_boxes_per_img:
-                max_boxes_per_img = len(boxes)
-        for k, boxes in enumerate(box_data):
-            new_boxes = np.zeros((max_boxes_per_img, 5))
-            if len(boxes) > 0:
-                new_boxes[:len(boxes)] = boxes
-            box_data[k] = new_boxes
-        box_data = np.array(box_data)
-        y_true = preprocess_true_boxes(box_data, self.input_shape, self.anchors, self.num_classes,
-                                       self.multi_anchor_assign, grid_shapes=self.grid_shapes)
-
-        return (image_data, *y_true), np.zeros(self.batch_size)
-
-    def on_epoch_end(self):
-        if self.shuffle == True:
-            np.random.shuffle(self.annotation_lines)
-
-
-def multigriddet_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, augment, enhance_augment,
-                              rescale_interval, multi_anchor_assign):
-    """Original data generator function for backward compatibility."""
-    n = len(annotation_lines)
-    i = 0
-    rescale_step = 0
-    input_shape_list = get_multiscale_list()
-    while True:
-        if rescale_interval > 0:
-            rescale_step = (rescale_step + 1) % rescale_interval
-            if rescale_step == 0:
-                input_shape = input_shape_list[random.randint(0, len(input_shape_list) - 1)]
-
-        image_data = []
-        box_data = []
-
-        for b in range(batch_size):
-            if i == 0:
-                np.random.shuffle(annotation_lines)
-            image, box = get_ground_truth_data(annotation_lines[i], input_shape, augment=augment)
-            image_data.append(image)
-            box_data.append(box)
-            i = (i + 1) % n
-        image_data = np.array(image_data)
-        max_boxes_per_img = 0
-        for boxes in box_data:
-            if len(boxes) > max_boxes_per_img:
-                max_boxes_per_img = len(boxes)
-        for k, boxes in enumerate(box_data):
-            new_boxes = np.zeros((max_boxes_per_img, 5))
-            if len(boxes) > 0:
-                new_boxes[:len(boxes)] = boxes
-            box_data[k] = new_boxes
-
-        box_data = np.array(box_data)
-        y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes, multi_anchor_assign)
-        yield [image_data, *y_true], np.zeros(batch_size)
-
-
-def multigriddet_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, augment,
-                                      enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, **kwargs):
-    """Original wrapper function for backward compatibility."""
-    n = len(annotation_lines)
-    if n == 0 or batch_size <= 0: 
-        return None
-    return multigriddet_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, augment,
-                                     enhance_augment, rescale_interval, multi_anchor_assign)

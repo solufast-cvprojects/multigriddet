@@ -21,7 +21,7 @@ Example:
 """
 
 # Import data generators
-from .generators import MultiGridDataGenerator, MultiGridDataGeneratorLegacy
+from .generators import MultiGridDataGenerator
 
 # Import augmentation functions
 from .augmentation import (
@@ -46,7 +46,6 @@ from .preprocessing import ImagePreprocessor
 __all__ = [
     # Data generators
     'MultiGridDataGenerator',
-    'MultiGridDataGeneratorLegacy',
     
     # Augmentation functions
     'letterbox_resize', 'random_resize_crop_pad', 'reshape_boxes',

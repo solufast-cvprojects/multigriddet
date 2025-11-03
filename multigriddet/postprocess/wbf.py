@@ -206,7 +206,7 @@ class WeightedBoxesFusion:
             
             # Calculate fused confidence
             fused_score = self._calculate_fused_confidence(
-                scores_array, weights_array, len(boxes_list)
+                scores_array, weights_array
             )
             
             fused_boxes.append(fused_box)
@@ -251,15 +251,13 @@ class WeightedBoxesFusion:
     
     def _calculate_fused_confidence(self, 
                                    scores: np.ndarray, 
-                                   weights: np.ndarray, 
-                                   num_models: int) -> float:
+                                   weights: np.ndarray) -> float:
         """
         Calculate fused confidence score.
         
         Args:
             scores: Confidence scores
             weights: Model weights
-            num_models: Total number of models
             
         Returns:
             Fused confidence score

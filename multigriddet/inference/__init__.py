@@ -8,7 +8,3 @@ from .inference_engine import MultiGridInference
 
 __all__ = ['MultiGridInference']
 
-
-
-
-

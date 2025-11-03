@@ -21,7 +21,7 @@ setup(
     author="Solomon Negussie Tesema",
     author_email="solomon.negussie.tesema@gmail.com",
     description="MultiGridDet: A modern implementation of 'Multi-Grid Redundant Bounding Box Annotation for Accurate Object Detection'",
-    keywords="object detection, multi-grid redundant bounding box annotation, traina",
+    keywords="object detection, multi-grid redundant bounding box annotation, yolo, tensorflow",
     long_description=long_description,
     long_description_content_type="text/markdown",
     project_urls={
@@ -55,22 +55,4 @@ setup(
         ],
     },
     include_package_data=True,
-    package_data={
-        "multigriddet": [
-            "configs/*.txt",
-            "configs/*.yaml",
-        ],
-    },
-    entry_points={
-        "console_scripts": [
-            "multigriddet-inference=multigriddet.scripts.inference:main", # infer the model
-            "multigriddet-train=multigriddet.scripts.train:main", # train the model
-            "multigriddet-eval=multigriddet.scripts.eval:main", # evaluate the model
-        ],
-    },
 )
-
-
-
-
-

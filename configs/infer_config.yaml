@@ -10,12 +10,16 @@ input:
 
 # Detection parameters
 detection:
-  confidence_threshold: 0.5
-  nms_threshold: 0.45
+  confidence_threshold: 0.1
+  nms_threshold: 0.45        # IoU threshold for NMS (lower = more aggressive suppression)
+  nms_method: 'diou'         # NMS method: 'standard', 'diou', 'soft', 'cluster'
+                             # - 'standard': Classic IoU-based NMS (fastest)
+                             # - 'diou': Distance-IoU NMS (better for overlapping objects, recommended)
+                             # - 'soft': Soft NMS (keeps low-confidence boxes, slower)
+                             # - 'cluster': Cluster-based NMS (balanced performance)
+  use_wbf: false             # Use Weighted Boxes Fusion instead of NMS (for ensemble models)
   max_boxes: 100
-  use_iol: true           # Use IoL instead of IoU
-  use_cluster_nms: true   # Cluster NMS instead of standard
-  use_diou: true          # DIoU-NMS
+  use_iol: true              # Use IoL (Intersection over Largest) instead of IoU
   
 # Output configuration
 output:

@@ -272,9 +272,9 @@ class MultiGridLiteHead(MultiGridHead):
         return super().build_head(feature_maps, num_classes, anchors)
 
 
-def denseyolo2_predictions(feature_maps, feature_channel_nums, num_anchors_per_head, num_classes, use_spp=False):
+def multigriddet_predictions(feature_maps, feature_channel_nums, num_anchors_per_head, num_classes, use_spp=False):
     """
-    MultiGridDet predictions function for compatibility.
+    MultiGridDet predictions function.
     This is the exact function from the original implementation.
     """
     from ..layers import DarknetConv2D_BN_Leaky, compose

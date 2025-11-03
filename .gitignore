@@ -211,3 +211,6 @@ test_*.mp4
 
 
 
+
+# GitHub Copilot instructions (private)
+.github/copilot-instructions.md

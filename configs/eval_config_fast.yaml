@@ -14,7 +14,7 @@ data:
 evaluation:
   batch_size: 8
   input_shape: [608, 608, 3]
-  confidence_threshold: 0.001
+  confidence_threshold: 0.1  # Confidence threshold for detection
   nms_threshold: 0.45
   use_iol: true
   
@@ -36,7 +36,16 @@ evaluation:
   save_results: true
   results_dir: results/evaluation
 
-# Visualization settings - DISABLED for fast evaluation
+# Visualization settings
 visualizations:
-  enabled: false
+  enabled: false  # Master switch - set to true to generate plots
+  
+  # Save annotated images during evaluation (for debugging/verification)
+  save_annotated_images:
+    enabled: false  # Set to true to save images with bounding boxes drawn
+    save_dir: results/evaluation/annotated_images
+    draw_predictions: true   # Draw predicted bounding boxes
+    draw_ground_truth: true  # Draw ground truth bounding boxes (for comparison)
+    max_images: 10          # Maximum number of images to save (0 = save all)
+    image_format: 'jpg'     # 'jpg' or 'png'
 

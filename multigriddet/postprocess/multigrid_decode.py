@@ -138,9 +138,10 @@ class MultiGridDecoder:
         
         # Rescore confidence using MultiGridDet strategy
         if self.rescore_confidence:
-            # Use objectness, best anchor probability, and class probability
+            # Use objectness, best anchor probability, and best class probability
             best_anchor_prob = np.max(anchor_probs, axis=-1, keepdims=True)
-            class_probs = objectness_probs * best_anchor_prob * class_probs
+            best_class_prob = np.max(class_probs, axis=-1, keepdims=True)
+            objectness_probs = objectness_probs * best_anchor_prob * best_class_prob
         
         # Combine all components
         prediction_decoded = np.concatenate([
@@ -253,11 +254,10 @@ class MultiGridDecoder:
         # Apply NMS or WBF
         if use_wbf:
             # Use Weighted Boxes Fusion
-            wbf = WeightedBoxesFusion()
+            wbf = WeightedBoxesFusion(iou_thr=nms_threshold)
             n_boxes, n_classes, n_scores = wbf.fuse_boxes(
                 [boxes], [classes], [scores], 
-                image_shape, 
-                iou_thr=nms_threshold
+                image_shape
             )
         else:
             # Use traditional NMS
@@ -318,8 +318,8 @@ class MultiGridDecoder:
         
         return boxes[top_indices], classes[top_indices], scores[top_indices]
     
-    def postprocess(self, 
-                   yolo_outputs: List[np.ndarray],
+    def postprocess(self,
+                   multigriddet_outputs: List[np.ndarray],
                    image_shape: Tuple[int, int],
                    model_image_size: Tuple[int, int],
                    max_boxes: int = 100,
@@ -327,26 +327,31 @@ class MultiGridDecoder:
                    nms_threshold: float = 0.5,
                    use_iol: bool = True,
                    nms_method: str = 'diou',
-                   use_wbf: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                   use_wbf: bool = False,
+                   return_xyxy: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Complete postprocessing pipeline.
         
         Args:
-            yolo_outputs: Raw model outputs
-            image_shape: Original image shape
-            model_image_size: Model input size
+            multigriddet_outputs: Raw model outputs
+            image_shape: Original image shape (height, width)
+            model_image_size: Model input size (height, width)
             max_boxes: Maximum number of boxes
             confidence: Confidence threshold
             nms_threshold: NMS threshold
             use_iol: Whether to use IoL
             nms_method: NMS method
             use_wbf: Whether to use WBF
+            return_xyxy: If True, return boxes in (xmin, ymin, xmax, ymax) format; 
+                        if False, return in (x, y, w, h) format
             
         Returns:
             Tuple of (boxes, classes, scores)
+            Boxes format: (xmin, ymin, xmax, ymax) if return_xyxy=True, 
+                         (x, y, w, h) if return_xyxy=False
         """
         # Decode predictions
-        predictions = self.decode_predictions(yolo_outputs)
+        predictions = self.decode_predictions(multigriddet_outputs)
         
         # Correct boxes to original image shape
         predictions = self.correct_boxes(predictions, image_shape, model_image_size)
@@ -357,119 +362,35 @@ class MultiGridDecoder:
             nms_threshold, use_iol, nms_method, use_wbf
         )
         
+        # Convert to xyxy format if requested
+        if return_xyxy and len(boxes) > 0:
+            boxes = self._convert_to_xyxy(boxes, image_shape)
+        
         return boxes, classes, scores
-
-
-# Backward compatibility functions
-def denseyolo2_decode(predictions, anchors, num_classes, input_dims, rescore_confidence=True):
-    """Backward compatibility function for DenseYOLO2 decode."""
-    decoder = MultiGridDecoder(anchors, num_classes, input_dims, rescore_confidence)
-    return decoder.decode_predictions(predictions)
-
-
-def denseyolo2_postprocess_np(yolo_outputs, image_shape, anchors, num_classes, 
-                             model_image_size, max_boxes=100, confidence=0.1, 
-                             use_iol=True, nms_threshold=0.5, rescore_confidence=True):
-    """Backward compatibility function for DenseYOLO2 postprocess."""
-    decoder = MultiGridDecoder(anchors, num_classes, model_image_size, rescore_confidence)
-    return decoder.postprocess(
-        yolo_outputs, image_shape, model_image_size, 
-        max_boxes, confidence, nms_threshold, use_iol
-    )
-
-
-# Additional backward compatibility functions for denseyolo_postprocess.py
-def denseyolo_decode(predictions, anchors, num_classes, input_dims, output_layer_id=None, rescore_confidence=True):
-    """Decode single prediction tensor."""
-    # Handle single prediction tensor
-    if len(predictions.shape) == 4:  # Single prediction (batch, height, width, channels)
-        batch_size = predictions.shape[0]
-        grid_size = predictions.shape[1:3]
-        num_anchors = len(anchors)
+    
+    def _convert_to_xyxy(self, boxes: np.ndarray, image_shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Convert boxes from (x, y, w, h) to (xmin, ymin, xmax, ymax) format.
         
-        # Create grid coordinates
-        grid_y = np.arange(grid_size[0])
-        grid_x = np.arange(grid_size[1])
-        x_offset, y_offset = np.meshgrid(grid_x, grid_y)
+        Args:
+            boxes: Boxes in (x, y, w, h) format
+            image_shape: Image shape (height, width)
+            
+        Returns:
+            Boxes in (xmin, ymin, xmax, ymax) format, clipped and rounded
+        """
+        boxes_xyxy = boxes.copy()
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2]  # xmax = x + w
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3]  # ymax = y + h
         
-        x_offset = np.reshape(x_offset, (-1, 1))
-        y_offset = np.reshape(y_offset, (-1, 1))
+        # Clip to image boundaries
+        height, width = image_shape[0], image_shape[1]
+        boxes_xyxy[:, 0] = np.clip(boxes_xyxy[:, 0], 0, width)   # xmin
+        boxes_xyxy[:, 1] = np.clip(boxes_xyxy[:, 1], 0, height)  # ymin
+        boxes_xyxy[:, 2] = np.clip(boxes_xyxy[:, 2], 0, width)   # xmax
+        boxes_xyxy[:, 3] = np.clip(boxes_xyxy[:, 3], 0, height)  # ymax
         
-        x_y_offset = np.concatenate((x_offset, y_offset), axis=1)
-        x_y_offset = np.reshape(x_y_offset, (-1, 2))
-        x_y_offset = np.reshape(x_y_offset, (-1, grid_size[0], grid_size[1], 2))
-        cell_grid = x_y_offset
+        # Round and convert to int32
+        boxes_xyxy = np.floor(boxes_xyxy + 0.5).astype('int32')
         
-        # Extract prediction components
-        raw_xy = predictions[..., 0:2]
-        raw_wh = predictions[..., 2:4]
-        objectness = predictions[..., 4:5]
-        anchor_probs = predictions[..., 5:5+num_anchors]
-        class_probs = predictions[..., 5+num_anchors:]
-        
-        # Apply activation functions
-        from scipy.special import expit, softmax
-        anchor_probs = softmax(anchor_probs, axis=-1)
-        class_probs = softmax(class_probs, axis=-1)
-        objectness_probs = expit(objectness)
-        
-        # MultiGridDet innovation: Use tanh + sigmoid for coordinate prediction
-        raw_xy = (np.tanh(0.15 * raw_xy) + expit(0.15 * raw_xy))
-        
-        # Convert to absolute coordinates
-        box_xy = raw_xy + cell_grid
-        box_xy /= grid_size  # Normalize to [0, 1]
-        
-        # Get best anchor for each grid cell
-        predicted_anchor_index = np.argmax(anchor_probs, axis=-1)
-        anchors_per_grid = np.take(anchors, predicted_anchor_index, axis=0)
-        
-        # Convert width and height
-        box_wh = anchors_per_grid * np.exp(raw_wh)
-        box_wh /= input_dims  # Normalize to [0, 1]
-        
-        # Rescore confidence using MultiGridDet strategy
-        if rescore_confidence:
-            best_anchor_prob = np.max(anchor_probs, axis=-1, keepdims=True)
-            class_probs = objectness_probs * best_anchor_prob * class_probs
-        
-        # Combine all components
-        prediction_decoded = np.concatenate([
-            box_xy, box_wh, objectness_probs, class_probs
-        ], axis=-1)
-        
-        # Reshape to (batch, num_boxes, features)
-        prediction_decoded = np.reshape(
-            prediction_decoded, 
-            (batch_size, grid_size[0] * grid_size[1], num_classes + 5)
-        )
-        
-        return prediction_decoded
-    else:
-        # Fallback to original method
-        return denseyolo2_decode(predictions, anchors, num_classes, input_dims, rescore_confidence)
-
-
-def denseyolo_handle_predictions(predictions, image_shape, max_boxes=100, confidence=0.1, 
-                                nms_threshold=0.5, use_iol=True, nms_method='diou', use_wbf=False,
-                                rescore_confidence=True, use_cluster_nms=False):
-    """Handle predictions with confidence filtering and NMS."""
-    decoder = MultiGridDecoder([], 0, (608, 608))  # Dummy decoder
-    return decoder.handle_predictions(
-        predictions, image_shape, max_boxes, confidence, 
-        nms_threshold, use_iol, nms_method, use_wbf
-    )
-
-
-def denseyolo_correct_boxes(predictions, image_shape, model_image_size):
-    """Correct bounding boxes back to original image shape."""
-    decoder = MultiGridDecoder([], 0, model_image_size)  # Dummy decoder
-    return decoder.correct_boxes(predictions, image_shape, model_image_size)
-
-
-def denseyolo_adjust_boxes(boxes, image_shape, model_image_size):
-    """Adjust boxes to original image coordinates."""
-    # This is a simple wrapper around correct_boxes
-    dummy_predictions = np.concatenate([boxes, np.zeros((boxes.shape[0], 1))], axis=-1)
-    corrected = denseyolo_correct_boxes(dummy_predictions, image_shape, model_image_size)
-    return corrected[..., :4]  # Return only the box coordinates
+        return boxes_xyxy

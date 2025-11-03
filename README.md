@@ -664,7 +664,7 @@ import numpy as np
 from PIL import Image
 from multigriddet.models import build_multigriddet_darknet
 from multigriddet.utils.anchors import load_anchors, load_classes
-from multigriddet.postprocess.denseyolo_postprocess import denseyolo2_postprocess_np
+from multigriddet.postprocess.multigrid_decode import MultiGridDecoder
 from multigriddet.utils.preprocessing import preprocess_image
 
 # Load model
@@ -686,8 +686,18 @@ predictions = model.predict(image_data)
 anchors = load_anchors('configs/yolov3_coco_anchor.txt')
 class_names = load_classes('configs/coco_classes.txt')
 
-boxes, classes, scores = denseyolo2_postprocess_np(
-    predictions, image.size, anchors, 80, (608, 608)
+decoder = MultiGridDecoder(
+    anchors=anchors,
+    num_classes=80,
+    input_shape=(608, 608),
+    rescore_confidence=True
+)
+
+boxes, classes, scores = decoder.postprocess(
+    predictions, 
+    tuple(reversed(image.size)),  # (height, width)
+    (608, 608),
+    return_xyxy=True
 )
 
 print(f"Found {len(boxes)} objects")

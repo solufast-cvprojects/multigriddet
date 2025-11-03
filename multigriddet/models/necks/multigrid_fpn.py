@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 MultiGrid FPN (Feature Pyramid Network) neck for MultiGridDet.
-Extracted from denseyolo2_predictions() implementation.
+Extracted from multigriddet_predictions() implementation.
 """
 
 import tensorflow as tf
@@ -39,7 +39,7 @@ class MultiGridFPN(BaseNeck):
     """
     MultiGrid FPN neck for MultiGridDet.
     
-    This neck implements the Feature Pyramid Network logic from denseyolo2_predictions():
+    This neck implements the Feature Pyramid Network logic from multigriddet_predictions():
     - Takes 3 feature maps from backbone: f3 (52x52), f2 (26x26), f1 (13x13)
     - Applies channel reduction convolutions
     - Performs upsampling and concatenation for FPN fusion
@@ -55,7 +55,7 @@ class MultiGridFPN(BaseNeck):
         """
         super().__init__(config)
         
-        # Feature channel numbers (from denseyolo2_predictions)
+        # Feature channel numbers (from multigriddet_predictions)
         self.f1_channel_num = config.get('f1_channel_num', 512)  # 13x13 scale
         self.f2_channel_num = config.get('f2_channel_num', 256)  # 26x26 scale  
         self.f3_channel_num = config.get('f3_channel_num', 128)  # 52x52 scale
@@ -79,7 +79,7 @@ class MultiGridFPN(BaseNeck):
         """
         f1, f2, f3 = feature_maps
         
-        # This follows the exact logic from denseyolo2_predictions()
+        # This follows the exact logic from multigriddet_predictions()
         # Process f1 first (13x13 scale)
         x = darknet_conv2d_bn_leaky(f1, self.f1_channel_num // 2, (1, 1), name='fpn_f1_reduce')
         
@@ -102,7 +102,7 @@ class MultiGridFPN(BaseNeck):
         x_f3 = darknet_conv2d_bn_leaky(x_f3, self.f3_channel_num, (3, 3), name='fpn_f3_conv2')
         
         # Return enhanced features in order: [f1, f2, f3] (largest to smallest)
-        # This matches the original denseyolo2_predictions return order
+        # This matches the original multigriddet_predictions return order
         return [f1, x_f2, x_f3]
     
     def get_output_shapes(self, input_shapes: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:

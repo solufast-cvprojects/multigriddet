@@ -15,7 +15,7 @@ import sys
 
 # Import from the new structure
 from .backbones.darknet import darknet53_body
-from .heads.multigrid_head import denseyolo2_predictions
+from .heads.multigrid_head import multigriddet_predictions
 
 # Import MultiGridLoss for training
 from ..losses.multigrid_loss import MultiGridLoss
@@ -65,7 +65,7 @@ def build_multigriddet_darknet(input_shape: Tuple[int, int, int] = (416, 416, 3)
     f3_channel_num = 128
     
     # Build predictions exactly as original implementation does
-    y1, y2, y3 = denseyolo2_predictions(
+    y1, y2, y3 = multigriddet_predictions(
         (f1, f2, f3), 
         (f1_channel_num, f2_channel_num, f3_channel_num),
         num_anchors_per_head,
@@ -187,6 +187,6 @@ MULTIGRIDDET_DARKNET_CONFIG = {
     'backbone_len': 185,
     'default_weights': 'model5.h5',
     'input_shape': (416, 416, 3),
-    'compatible_with': 'denseyolo2_darknet',
+    'compatible_with': 'multigriddet_darknet',
     'description': 'TRUE MultiGridDet with Darknet53'
 }

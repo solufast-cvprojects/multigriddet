@@ -14,7 +14,7 @@ data:
 evaluation:
   batch_size: 8
   input_shape: [608, 608, 3]
-  confidence_threshold: 0.001
+  confidence_threshold: 0.1  # Confidence threshold for detection
   nms_threshold: 0.45
   use_iol: true
   

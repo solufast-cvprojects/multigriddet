@@ -16,8 +16,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from ..config import ConfigLoader, build_model_for_inference
 from ..utils.anchors import load_anchors, load_classes
 from ..utils.tf_optimization import optimize_tf_gpu
-from ..postprocess.denseyolo_postprocess import denseyolo2_postprocess_np 
-#from ..postprocess.multigriddet_postprocess import denseyolo2_postprocess_np
+from ..postprocess.multigrid_decode import MultiGridDecoder
 from ..utils.preprocessing import preprocess_image
 from ..utils.visualization import get_colors, draw_boxes
 
@@ -79,6 +78,15 @@ class MultiGridInference:
         self.anchors = load_anchors(anchors_path)
         self.colors = get_colors(len(self.class_names))
         
+        # Initialize decoder
+        input_shape = tuple(self.model_config['model']['preset'].get('input_shape', [608, 608, 3])[:2])
+        self.decoder = MultiGridDecoder(
+            anchors=self.anchors,
+            num_classes=len(self.class_names),
+            input_shape=input_shape,
+            rescore_confidence=True
+        )
+        
         print(f"   Classes: {len(self.class_names)}")
         print(f"   Anchors: {len(self.anchors)} scales")
         
@@ -114,17 +122,19 @@ class MultiGridInference:
         
         # Post-process
         detection_config = self.config.get('detection', {})
-        boxes, classes, scores = denseyolo2_postprocess_np(
+        nms_method = detection_config.get('nms_method', 'diou')
+        use_wbf = detection_config.get('use_wbf', False)
+        boxes, classes, scores = self.decoder.postprocess(
             predictions,
             image_shape,
-            self.anchors,
-            len(self.class_names),
             input_shape,
             max_boxes=detection_config.get('max_boxes', 100),
             confidence=detection_config.get('confidence_threshold', 0.5),
-            rescore_confidence=True,
             nms_threshold=detection_config.get('nms_threshold', 0.45),
-            use_iol=detection_config.get('use_iol', True)
+            nms_method=nms_method,
+            use_wbf=use_wbf,
+            use_iol=detection_config.get('use_iol', True),
+            return_xyxy=True
         )
         
         # Draw boxes
@@ -193,17 +203,19 @@ class MultiGridInference:
                 predictions = self.model.predict(image_data, verbose=0)
                 
                 # Post-process
-                boxes, classes, scores = denseyolo2_postprocess_np(
+                nms_method = detection_config.get('nms_method', 'diou')
+                use_wbf = detection_config.get('use_wbf', False)
+                boxes, classes, scores = self.decoder.postprocess(
                     predictions,
                     image_shape,
-                    self.anchors,
-                    len(self.class_names),
                     input_shape,
                     max_boxes=detection_config.get('max_boxes', 100),
                     confidence=detection_config.get('confidence_threshold', 0.5),
-                    rescore_confidence=True,
                     nms_threshold=detection_config.get('nms_threshold', 0.45),
-                    use_iol=detection_config.get('use_iol', True)
+                    nms_method=nms_method,
+                    use_wbf=use_wbf,
+                    use_iol=detection_config.get('use_iol', True),
+                    return_xyxy=True
                 )
                 
                 # Draw boxes
@@ -289,17 +301,19 @@ class MultiGridInference:
                 predictions = self.model.predict(image_data, verbose=0)
                 
                 # Post-process
-                boxes, classes, scores = denseyolo2_postprocess_np(
+                nms_method = detection_config.get('nms_method', 'diou')
+                use_wbf = detection_config.get('use_wbf', False)
+                boxes, classes, scores = self.decoder.postprocess(
                     predictions,
                     image_shape,
-                    self.anchors,
-                    len(self.class_names),
                     input_shape,
                     max_boxes=detection_config.get('max_boxes', 100),
                     confidence=detection_config.get('confidence_threshold', 0.5),
-                    rescore_confidence=True,
                     nms_threshold=detection_config.get('nms_threshold', 0.45),
-                    use_iol=detection_config.get('use_iol', True)
+                    nms_method=nms_method,
+                    use_wbf=use_wbf,
+                    use_iol=detection_config.get('use_iol', True),
+                    return_xyxy=True
                 )
                 
                 # Draw boxes

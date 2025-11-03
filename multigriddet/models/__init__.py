@@ -20,7 +20,6 @@ from .necks import *
 # Import model builders
 from .multigriddet_resnet import build_multigriddet_resnet, build_multigriddet_resnet_train
 from .multigriddet_darknet import build_multigriddet_darknet, build_multigriddet_darknet_train
-from .compat import get_model_for_inference, get_training_model_for_compatibility
 
 __all__ = [
     # Base classes
@@ -40,8 +39,4 @@ __all__ = [
     "build_multigriddet_resnet_train",
     "build_multigriddet_darknet",
     "build_multigriddet_darknet_train",
-    
-    # Compatibility
-    "get_model_for_inference",
-    "get_training_model_for_compatibility",
 ]

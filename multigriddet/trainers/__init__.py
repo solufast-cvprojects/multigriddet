@@ -8,7 +8,3 @@ from .trainer import MultiGridTrainer
 
 __all__ = ['MultiGridTrainer']
 
-
-
-
-

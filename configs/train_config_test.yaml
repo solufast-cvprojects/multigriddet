@@ -3,8 +3,8 @@ model_config: configs/models/multigriddet_darknet.yaml
 
 # Dataset paths
 data:
-  train_annotation: data/coco_train2017.txt
-  val_annotation: data/coco_val2017.txt
+  train_annotation: data/coco_train2017_test.txt
+  val_annotation: data/coco_val2017_test.txt
   classes_path: configs/coco_classes.txt
   
 # Training parameters - MINIMAL FOR TESTING

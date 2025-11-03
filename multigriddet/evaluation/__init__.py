@@ -8,7 +8,3 @@ from .evaluator import MultiGridEvaluator
 
 __all__ = ['MultiGridEvaluator']
 
-
-
-
-

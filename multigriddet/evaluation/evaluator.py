@@ -10,7 +10,9 @@ Fast Evaluator for MultiGridDet models.
 
 import os
 import json
+import time
 import numpy as np
+import cv2
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from tqdm import tqdm
@@ -19,9 +21,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..config import ConfigLoader, build_model_for_inference
 from ..utils.anchors import load_anchors, load_classes
 from ..utils.tf_optimization import optimize_tf_gpu
-from ..postprocess.denseyolo_postprocess import denseyolo2_postprocess_np
-#from ..postprocess.multigriddet_postprocess import denseyolo2_postprocess_np 
+from ..postprocess.multigrid_decode import MultiGridDecoder 
 from ..utils.preprocessing import preprocess_image, preprocess_image_batch
+from ..utils.visualization import draw_boxes, get_colors
 from PIL import Image
 
 # ---- New: TensorFlow (used only for the fast path) ----
@@ -79,7 +81,21 @@ class MultiGridEvaluator:
         print(f"   Anchors: {len(self.anchors)} scales")
         
         self.model = build_model_for_inference(self.full_config, weights_path)
+        
+        # Initialize decoder
+        eval_config = self.config.get('evaluation', {})
+        model_image_size = tuple(eval_config.get('input_shape', [608, 608, 3])[:2])
+        self.decoder = MultiGridDecoder(
+            anchors=self.anchors,
+            num_classes=len(self.class_names),
+            input_shape=model_image_size,
+            rescore_confidence=True
+        )
+        
         print(f" Model loaded successfully\n")
+        
+        # Setup colors for visualization if needed
+        self.colors = get_colors(len(self.class_names))
     
     # ---------- Annotation loading (unchanged logic) ----------
     def _load_annotations(self, annotation_file: str) -> List[Dict]:
@@ -100,6 +116,75 @@ class MultiGridEvaluator:
                 annotations.append({'image_path': image_path, 'boxes': boxes})
         print(f" Loaded {len(annotations)} annotations\n")
         return annotations
+    
+    def _save_annotated_image(self, image_path: str, image_id: int, 
+                              pred_boxes: List[Dict], gt_boxes: List[Dict],
+                              viz_config: Dict) -> None:
+        """
+        Save an annotated image with predicted and/or ground truth boxes.
+        
+        Args:
+            image_path: Path to original image
+            image_id: Image ID
+            pred_boxes: List of prediction dicts with 'bbox', 'class', 'score'
+            gt_boxes: List of ground truth dicts with 'bbox', 'class'
+            viz_config: Visualization configuration
+        """
+        try:
+            # Load original image
+            image = Image.open(image_path)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            image_array = np.array(image, dtype='uint8')
+            
+            # Draw predictions if enabled
+            if viz_config.get('draw_predictions', True) and len(pred_boxes) > 0:
+                # Use the same confidence threshold as evaluation
+                # pred_boxes already filtered by evaluation confidence_threshold during postprocess
+                # So we can draw all boxes that were returned
+                pred_boxes_array = np.array([p['bbox'] for p in pred_boxes])
+                pred_classes = np.array([p['class'] for p in pred_boxes])
+                pred_scores = np.array([p['score'] for p in pred_boxes])
+                
+                image_array = draw_boxes(
+                    image_array,
+                    pred_boxes_array,
+                    pred_classes,
+                    pred_scores,
+                    self.class_names,
+                    self.colors,
+                    show_score=True
+                )
+            
+            # Draw ground truth if enabled (in different style/color)
+            if viz_config.get('draw_ground_truth', True) and len(gt_boxes) > 0:
+                gt_boxes_array = np.array([gt['bbox'] for gt in gt_boxes])
+                gt_classes = np.array([gt['class'] for gt in gt_boxes])
+                gt_scores = np.ones(len(gt_classes))  # Dummy scores for GT
+                
+                # Use darker/thinner lines for GT to distinguish from predictions
+                for i, (box, cls) in enumerate(zip(gt_boxes_array, gt_classes)):
+                    xmin, ymin, xmax, ymax = map(int, box)
+                    # Draw GT boxes with dashed/different style
+                    cv2.rectangle(image_array, (xmin, ymin), (xmax, ymax), 
+                                 (0, 255, 0), 1, cv2.LINE_AA)  # Green for GT
+                    label = f"GT: {self.class_names[cls]}"
+                    cv2.putText(image_array, label, (xmin, ymin - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+            # Save annotated image
+            save_dir = viz_config.get('save_dir', 'results/evaluation/annotated_images')
+            os.makedirs(save_dir, exist_ok=True)
+            
+            image_format = viz_config.get('image_format', 'jpg')
+            filename = f"img_{image_id:06d}.{image_format}"
+            save_path = os.path.join(save_dir, filename)
+            
+            annotated_image = Image.fromarray(image_array)
+            annotated_image.save(save_path, quality=95 if image_format == 'jpg' else None)
+            
+        except Exception as e:
+            print(f"[WARNING] Failed to save annotated image {image_id}: {e}")
     
     # ---------- Fast tf.data pipeline ----------
     def _build_dataset(self, annotations: List[Dict], input_shape: Tuple[int, int], batch_size: int):
@@ -156,6 +241,8 @@ class MultiGridEvaluator:
                                     input_shape,
                                     confidence_threshold,
                                     nms_threshold,
+                                    nms_method,
+                                    use_wbf,
                                     use_iol):
         """
         Postprocess each image in a batch in parallel threads.
@@ -171,17 +258,18 @@ class MultiGridEvaluator:
             else:
                 img_outputs = batch_raw_outputs[i:i+1].numpy()
 
-            boxes, classes, scores = denseyolo2_postprocess_np(
+            image_shape = tuple(int(x) for x in batch_meta["orig_shape"][i].tolist())
+            boxes, classes, scores = self.decoder.postprocess(
                 img_outputs,
-                tuple(int(x) for x in batch_meta["orig_shape"][i].tolist()),
-                self.anchors,
-                len(self.class_names),
+                image_shape,
                 input_shape,
                 max_boxes=500,
                 confidence=confidence_threshold,
-                rescore_confidence=True,
                 nms_threshold=nms_threshold,
-                use_iol=use_iol
+                nms_method=nms_method,
+                use_wbf=use_wbf,
+                use_iol=use_iol,
+                return_xyxy=True
             )
             image_id = int(batch_meta["image_id"][i])
             # Convert to a compact ndarray to avoid Python dict overhead inside the thread
@@ -216,6 +304,8 @@ class MultiGridEvaluator:
         print("Starting Evaluation (FAST PATH)")
         print("=" * 80)
         
+        total_eval_start_time = time.time()
+        
         annotation_file = self.config['data']['annotation']
         annotations = self._load_annotations(annotation_file)
         
@@ -223,6 +313,8 @@ class MultiGridEvaluator:
         input_shape = tuple(eval_config['input_shape'][:2])
         confidence_threshold = eval_config['confidence_threshold']
         nms_threshold = eval_config['nms_threshold']
+        nms_method = eval_config.get('nms_method', 'diou')  # Default to DIoU for better performance
+        use_wbf = eval_config.get('use_wbf', False)
         use_iol = eval_config.get('use_iol', True)
         batch_size = int(eval_config.get('batch_size', 1))
         max_images = eval_config.get('max_images', None)
@@ -232,6 +324,8 @@ class MultiGridEvaluator:
         print(f"   Input shape: {input_shape}")
         print(f"   Confidence threshold: {confidence_threshold}")
         print(f"   NMS threshold: {nms_threshold}")
+        print(f"   NMS method: {nms_method.upper()}")
+        print(f"   Use WBF: {use_wbf}")
         print(f"   Use IoL: {use_iol}")
         print(f"   Batch size: {batch_size}")
         print(f"   tf.data fast path: {use_tfdata and TF_AVAILABLE}")
@@ -244,10 +338,33 @@ class MultiGridEvaluator:
 
         # GT cache by image_id (to avoid repeated per-image loops later)
         gt_by_img = {idx: a['boxes'] for idx, a in enumerate(annotations)}
+        
+        # Image path cache for visualization
+        img_path_by_id = {idx: a['image_path'] for idx, a in enumerate(annotations)}
 
         all_predictions: List[Dict] = []
         all_ground_truths: List[Dict] = []
+        
+        # Check if we should save annotated images
+        viz_config = self.config.get('visualizations', {})
+        save_images_config = viz_config.get('save_annotated_images', {})
+        save_images_enabled = save_images_config.get('enabled', False)
+        max_save_images = save_images_config.get('max_images', 10)
+        images_saved_count = 0
+        
+        if save_images_enabled:
+            print(f"[INFO] Saving annotated images: enabled")
+            print(f"   Save directory: {save_images_config.get('save_dir', 'results/evaluation/annotated_images')}")
+            print(f"   Max images to save: {max_save_images if max_save_images > 0 else 'all'}")
+            print(f"   Draw predictions: {save_images_config.get('draw_predictions', True)}")
+            print(f"   Draw ground truth: {save_images_config.get('draw_ground_truth', True)}")
+            print(f"   Using evaluation confidence threshold: {confidence_threshold}")
+            print()
 
+        # Phase 1: Inference - Start timing
+        print("[PHASE 1] Running inference on all images...")
+        inference_start_time = time.time()
+        
         if use_tfdata:
             ds = self._build_dataset(annotations, input_shape, batch_size)
             total_images = len(annotations)
@@ -267,18 +384,34 @@ class MultiGridEvaluator:
 
                 # Parallel postprocess
                 batch_predictions = self._postprocess_batch_parallel(
-                    batch_raw, meta, input_shape, confidence_threshold, nms_threshold, use_iol
+                    batch_raw, meta, input_shape, confidence_threshold, nms_threshold, nms_method, use_wbf, use_iol
                 )
                 all_predictions.extend(batch_predictions)
 
                 # Append GT for all images in this batch (vectorized)
                 for img_id in meta["image_id"]:
-                    for gt in gt_by_img[int(img_id)]:
+                    img_id_int = int(img_id)
+                    for gt in gt_by_img[img_id_int]:
                         all_ground_truths.append({
-                            'image_id': int(img_id),
+                            'image_id': img_id_int,
                             'class': gt['class'],
                             'bbox': gt['bbox']
                         })
+                    
+                    # Save annotated images if enabled
+                    if save_images_enabled:
+                        if max_save_images == 0 or images_saved_count < max_save_images:
+                            # Get predictions for this image
+                            img_preds = [p for p in batch_predictions if p['image_id'] == img_id_int]
+                            # Get ground truth for this image
+                            img_gts = gt_by_img[img_id_int]
+                            # Get image path
+                            img_path = img_path_by_id[img_id_int]
+                            
+                            self._save_annotated_image(
+                                img_path, img_id_int, img_preds, img_gts, save_images_config
+                            )
+                            images_saved_count += 1
 
                 processed += meta["image_id"].shape[0]
 
@@ -329,26 +462,67 @@ class MultiGridEvaluator:
                 }
 
                 batch_predictions = self._postprocess_batch_parallel(
-                    raw, meta, input_shape, confidence_threshold, nms_threshold, use_iol
+                    raw, meta, input_shape, confidence_threshold, nms_threshold, nms_method, use_wbf, use_iol
                 )
                 all_predictions.extend(batch_predictions)
 
                 for img_id in meta["image_id"]:
-                    for gt in gt_by_img[int(img_id)]:
+                    img_id_int = int(img_id)
+                    for gt in gt_by_img[img_id_int]:
                         all_ground_truths.append({
-                            'image_id': int(img_id),
+                            'image_id': img_id_int,
                             'class': gt['class'],
                             'bbox': gt['bbox']
                         })
+                    
+                    # Save annotated images if enabled
+                    if save_images_enabled:
+                        if max_save_images == 0 or images_saved_count < max_save_images:
+                            # Get predictions for this image
+                            img_preds = [p for p in batch_predictions if p['image_id'] == img_id_int]
+                            # Get ground truth for this image
+                            img_gts = gt_by_img[img_id_int]
+                            # Get image path
+                            img_path = img_path_by_id[img_id_int]
+                            
+                            self._save_annotated_image(
+                                img_path, img_id_int, img_preds, img_gts, save_images_config
+                            )
+                            images_saved_count += 1
 
             print(f"\n Processed {len(annotations)} images (legacy path)")
 
+        # Phase 1: Inference - End timing
+        inference_end_time = time.time()
+        inference_duration = inference_end_time - inference_start_time
+        print(f"\n{'='*80}")
+        print(f"[PHASE 1] Inference completed in {inference_duration:.2f} seconds ({inference_duration/60:.2f} minutes)")
         print(f"   Total predictions: {len(all_predictions)}")
-        print(f"   Total ground truths: {len(all_ground_truths)}\n")
+        print(f"   Total ground truths: {len(all_ground_truths)}")
+        if save_images_enabled:
+            print(f"   Annotated images saved: {images_saved_count}")
+        if len(annotations) > 0:
+            print(f"   Average speed: {len(annotations)/inference_duration:.2f} images/sec")
+        print(f"{'='*80}\n")
         
-        # --------- mAP calculation (unchanged external API) ----------
-        print("[INFO] Calculating mAP metrics...")
+        # --------- Phase 2: mAP calculation ----------
+        print("[PHASE 2] Calculating mAP metrics...")
+        map_start_time = time.time()
         results = self._calculate_metrics(all_predictions, all_ground_truths, eval_config)
+        map_end_time = time.time()
+        map_duration = map_end_time - map_start_time
+        print(f"\n{'='*80}")
+        print(f"[PHASE 2] mAP calculation completed in {map_duration:.2f} seconds ({map_duration/60:.2f} minutes)")
+        print(f"{'='*80}\n")
+        
+        # Total evaluation time
+        total_eval_end_time = time.time()
+        total_eval_duration = total_eval_end_time - total_eval_start_time
+        print(f"{'='*80}")
+        print(f"[TOTAL] Evaluation completed in {total_eval_duration:.2f} seconds ({total_eval_duration/60:.2f} minutes)")
+        print(f"   Phase 1 (Inference): {inference_duration:.2f}s ({inference_duration/total_eval_duration*100:.1f}%)")
+        print(f"   Phase 2 (mAP):        {map_duration:.2f}s ({map_duration/total_eval_duration*100:.1f}%)")
+        print(f"{'='*80}\n")
         
         if eval_config.get('save_results', True):
             self._save_results(results, eval_config)
@@ -394,10 +568,12 @@ class MultiGridEvaluator:
             image_data = preprocess_image(image, input_shape)
             image_shape = tuple(reversed(image.size))
             model_predictions = self.model.predict(image_data, verbose=0)
-            boxes, classes, scores = denseyolo2_postprocess_np(
-                model_predictions, image_shape, self.anchors, len(self.class_names),
-                input_shape, max_boxes=500, confidence=confidence_threshold,
-                rescore_confidence=True, nms_threshold=nms_threshold, use_iol=use_iol
+            boxes, classes, scores = self.decoder.postprocess(
+                model_predictions, image_shape, input_shape,
+                max_boxes=500, confidence=confidence_threshold,
+                nms_threshold=nms_threshold, nms_method=nms_method,
+                use_wbf=use_wbf, use_iol=use_iol,
+                return_xyxy=True
             )
             for box, cls, score in zip(boxes, classes, scores):
                 predictions.append({

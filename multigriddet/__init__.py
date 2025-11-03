@@ -16,26 +16,31 @@ Key Features:
 Example:
     >>> import multigriddet
     >>> from multigriddet.models import create_model
-    >>> from multigriddet.data import create_dataset
+    >>> from multigriddet.data import MultiGridDataGenerator
     >>> 
     >>> # Create model
-    >>> model = create_model("multigriddet_darknet53", num_classes=80)
+    >>> model, _ = create_model("multigriddet_darknet", num_classes=80)
     >>> 
-    >>> # Create dataset
-    >>> dataset = create_dataset("path/to/annotations.txt", batch_size=16)
+    >>> # Create dataset generator
+    >>> generator = MultiGridDataGenerator(
+    ...     annotation_lines=lines,
+    ...     batch_size=16,
+    ...     input_shape=(608, 608),
+    ...     anchors=anchors,
+    ...     num_classes=80
+    ... )
     >>> 
     >>> # Train model
-    >>> model.fit(dataset, epochs=100)
+    >>> model.fit(generator, epochs=100)
 """
 
 __version__ = "1.0.0"
-__author__ = "MultiGridDet Team"
-__email__ = ""
+__author__ = "Solomon N. Tesema"
+__email__ = "solomon.negussie.tesema@gmail.com"
 
 # Core imports
 from . import models
-# Temporarily comment out data import to fix standalone functionality
-# from . import data
+from . import data
 from . import losses
 from . import postprocess
 from . import metrics
