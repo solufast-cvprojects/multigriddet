@@ -1,0 +1,26 @@
+# GitHub Pages Configuration for MultiGridDet
+title: MultiGridDet
+description: A modern implementation of Multi-Grid Object Detection with 3×3 redundant bounding-box assignment
+url: https://solufast-cvprojects.github.io
+baseurl: ""
+
+# Jekyll settings
+theme: minima
+plugins:
+  - jekyll-sitemap
+  - jekyll-feed
+
+# SEO settings
+author: Solomon Negussie Tesema
+github_username: solufast-cvprojects
+
+# Exclude files from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle
+  - vendor/cache
+  - vendor/gems
+  - vendor/ruby
+

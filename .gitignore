@@ -214,3 +214,12 @@ test_*.mp4
 
 # GitHub Copilot instructions (private)
 .github/copilot-instructions.md
+
+# Private strategy documents
+VISIBILITY_STRATEGY.md
+.env
+.env.local
+.env.*.local
+
+# Security checklist (private)
+GITHUB_SECURITY_CHECKLIST.md

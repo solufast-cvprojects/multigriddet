@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://solufast-cvprojects.github.io/multigriddet/sitemap.xml
+

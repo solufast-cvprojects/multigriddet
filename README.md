@@ -1,12 +1,32 @@
 # MultiGridDet
 
-A modern implementation of Multi-Grid Object Detection, featuring efficient multi-grid cell annotation and trainable anchor prediction.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![TensorFlow 2.17+](https://img.shields.io/badge/tensorflow-2.17+-orange.svg)](https://www.tensorflow.org/)
+[![GitHub stars](https://img.shields.io/github/stars/solufast-cvprojects/multigriddet.svg?style=social&label=Star)](https://github.com/solufast-cvprojects/multigriddet)
+[![GitHub forks](https://img.shields.io/github/forks/solufast-cvprojects/multigriddet.svg?style=social&label=Fork)](https://github.com/solufast-cvprojects/multigriddet)
+
+A modern implementation of Multi-Grid Object Detection, featuring efficient multi-grid cell annotation and trainable anchor prediction. Based on the [IEEE paper](https://ieeexplore.ieee.org/document/9730183) "Multi-Grid Redundant Bounding Box Annotation for Accurate Object Detection".
 
 ## Overview
 
 MultiGridDet is an enhanced one-stage object detector derived from YOLOv3, introducing **multi-grid redundant bounding-box assignment** for tighter and more stable object localization. Unlike conventional YOLO approaches where only the grid cell containing the object's center is responsible for prediction, MultiGridDet extends this responsibility to the **3×3 grid neighborhood** (center cell plus its eight adjacent cells).
 
 This redundant supervision allows multiple grid cells to view and predict the same object from slightly different spatial perspectives, reducing prediction noise, balancing positive-negative grid ratios, and accelerating bounding-box convergence during training.
+
+### Project Status
+
+**Current Version**: v1.0.0 (Beta)
+
+This project is in active development. The core algorithm is fully implemented and functional for training and inference. We are continuously working on:
+- **SIGtor Integration**: Releasing SIGtor (offline copy-paste augmentation tool used in original training)
+- Optimizing data augmentation strategies
+- Improving training best practices and hyperparameters
+- Performance benchmarking and comparisons
+- Documentation enhancements
+- Pre-trained weights distribution (original weights with paper-matched results)
+
+**Status**: ✅ Core features complete | 🔄 Optimization in progress
 
 ### Key Technical Contributions
 
@@ -149,7 +169,7 @@ for dx in (-1, 0, 1):
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/MultiGridDet.git
+git clone https://github.com/solufast-cvprojects/multigriddet.git
 cd MultiGridDet
 
 # Install dependencies
@@ -158,6 +178,12 @@ pip install -r requirements.txt
 # Install the package
 pip install -e .
 ```
+
+### Pre-trained Weights
+
+Pre-trained weights (trained 5 years ago, results match paper performance) will be available soon. The weights file is ~180 MB and we are evaluating the best hosting solution for distribution.
+
+**Note**: The original training used SIGtor (offline copy-paste augmentation tool) which will also be released publicly in the near future. See [ROADMAP.md](ROADMAP.md) for details.
 
 ### Quick Test
 
@@ -739,6 +765,14 @@ If you use MultiGridDet in your research, please cite:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for upcoming features and development plans, including:
+- SIGtor integration (offline copy-paste augmentation tool)
+- Pre-trained weights distribution
+- Training optimization strategies
+- Performance benchmarks and comparisons
 
 ## Contributing
 
