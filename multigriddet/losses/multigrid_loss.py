@@ -304,8 +304,8 @@ class MultiGridLoss:
         Compute MSE loss for localization (YOLOv3 style).
         
         Formula:
-        L_xy = Σ object_mask × (true_xy - pred_xy)²
-        L_wh = Σ object_mask × (true_wh - pred_wh)²
+        L_xy = Σ object_mask * (true_xy - pred_xy)²
+        L_wh = Σ object_mask * (true_wh - pred_wh)²
         L_location = L_xy + L_wh
         """
         # XY coordinate loss
@@ -328,7 +328,7 @@ class MultiGridLoss:
         Compute anchor prediction loss using BCE.
         
         Formula:
-        L_anchor = Σ (object_mask + ignore_mask) × BCE(true_anchors, pred_anchors) / batch_size
+        L_anchor = Σ (object_mask + ignore_mask) * BCE(true_anchors, pred_anchors) / batch_size
         """
         if ignore_mask is None:
             ignore_mask = tf.zeros_like(object_mask)
@@ -366,7 +366,7 @@ class MultiGridLoss:
         Compute BCE loss for classification (all classes, not top-k!).
         
         Formula:
-        L_class = Σ object_mask × BCE(true_class, pred_class) / batch_size
+        L_class = Σ object_mask * BCE(true_class, pred_class) / batch_size
         
         Applies to ALL classes, ensuring all classes receive gradients.
         """
