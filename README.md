@@ -19,7 +19,6 @@ This redundant supervision allows multiple grid cells to view and predict the sa
 **Current Version**: v1.0.0 (Beta)
 
 This project is in active development. The core algorithm is fully implemented and functional for training and inference. We are continuously working on:
-- **SIGtor Integration**: Releasing SIGtor (offline copy-paste augmentation tool used in original training)
 - Optimizing data augmentation strategies
 - Improving training best practices and hyperparameters
 - Performance benchmarking and comparisons
@@ -54,6 +53,7 @@ This project is in active development. The core algorithm is fully implemented a
 - **CLI Interface**: Professional command-line tools for training, inference, and evaluation
 - **Two-Stage Training**: Transfer learning support with backbone freezing
 - **Data Augmentation**: Mosaic, GridMask, multi-scale training
+- **SIGtor Integration**: Compatible with [SIGtor](https://github.com/solomontesema/SIGtor) for offline copy-paste augmentation
 - **Production-Ready**: Error handling, progress tracking, and comprehensive logging
 
 ## Core Algorithm Summary
@@ -183,7 +183,11 @@ pip install -e .
 
 Pre-trained weights (trained 5 years ago, results match paper performance) will be available soon. The weights file is ~180 MB and we are evaluating the best hosting solution for distribution.
 
-**Note**: The original training used SIGtor (offline copy-paste augmentation tool) which will also be released publicly in the near future. See [ROADMAP.md](ROADMAP.md) for details.
+**Note**: The original training used [SIGtor](https://github.com/solomontesema/SIGtor) (offline copy-paste augmentation tool) for generating synthetic training data. SIGtor is now publicly available and can be used to augment datasets for MultiGridDet training.
+
+### Data Augmentation with SIGtor
+
+For offline copy-paste augmentation, use [SIGtor](https://github.com/solomontesema/SIGtor) to generate synthetic training datasets. SIGtor was used during the original MultiGridDet training and supports YOLO, COCO, and Pascal VOC formats.
 
 ### Quick Test
 
@@ -325,6 +329,7 @@ Controls all training parameters:
   - Option 2: IoL-weighted MSE with anchor prediction mask
   - Option 3: GIoU/DIoU localization loss
 - **Data augmentation**: Mosaic, GridMask, multi-scale training
+- **External augmentation**: Compatible with [SIGtor](https://github.com/solomontesema/SIGtor) for offline copy-paste augmentation
 - **Optimizer**: Adam/SGD with configurable parameters
 - **Learning rate schedule**: ReduceLROnPlateau, step decay, etc.
 - **Callbacks**: TensorBoard, ModelCheckpoint, EarlyStopping
@@ -766,10 +771,22 @@ If you use MultiGridDet in your research, please cite:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## Data Augmentation with SIGtor
+
+MultiGridDet was originally trained using [SIGtor](https://github.com/solomontesema/SIGtor), an offline copy-paste augmentation tool for object detection. SIGtor generates synthetic datasets with automatic annotations, supporting YOLO, COCO, and Pascal VOC formats.
+
+**Key Features of SIGtor**:
+- Offline copy-paste augmentation (no GANs required)
+- Automatic annotation generation
+- Context-aware blending and color harmonization
+- Multi-stage post-processing for artifact reduction
+- Supports YOLO, COCO, and Pascal VOC formats
+
+Use SIGtor to augment your training datasets before training MultiGridDet models. See the [SIGtor repository](https://github.com/solomontesema/SIGtor) for installation and usage instructions.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for upcoming features and development plans, including:
-- SIGtor integration (offline copy-paste augmentation tool)
 - Pre-trained weights distribution
 - Training optimization strategies
 - Performance benchmarks and comparisons
