@@ -14,7 +14,7 @@ data_loader:
   prefetch_buffer: 6             # Prefetch buffer in batches (6 = good GPU-CPU overlap, 'auto' uses AUTOTUNE)
   num_parallel_calls: 24         # Parallel calls for preprocessing (24 = aggressive, 'auto' uses AUTOTUNE)
   shuffle_buffer_size: 8192      # Shuffle buffer size (larger = better randomization, default: 4096)
-  interleave_cycle_length: 16    # Parallel file reading (16 = good I/O overlap, None = disabled)
+  interleave_cycle_length: null  # Parallel file reading (null = auto-disable for frozen backbone, or set 8-16 for full training)
   num_workers: 8                 # Number of CPU worker threads for data loading (legacy mode only)
   cache_images: false            # Cache decoded images in memory (optional, uses more RAM)
   
@@ -38,7 +38,7 @@ training:
   augmentation:
     enabled: true
     enhance_type: null     # 'mosaic', 'gridmask', or null
-    rescale_interval: 10   # Multi-scale training ENABLED - your brilliant solution!
+    rescale_interval: -1   # Multi-scale training DISABLED (set to -1 to disable)
   
   # Multi-anchor assignment
   multi_anchor_assign: false
