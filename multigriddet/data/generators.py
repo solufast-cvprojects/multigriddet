@@ -55,6 +55,221 @@ if gpus:
         print(f"GPU memory growth setting failed: {e}")
 
 
+# =============================================================================
+# TensorFlow-native image loading and preprocessing functions
+# =============================================================================
+
+def tf_load_and_decode_image(image_path: tf.Tensor) -> tf.Tensor:
+    """
+    Load and decode image using TensorFlow operations.
+    
+    Args:
+        image_path: Tensor containing image file path (bytes)
+        
+    Returns:
+        Decoded image tensor of shape (H, W, 3) with dtype uint8
+    """
+    image_bytes = tf.io.read_file(image_path)
+    image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+    image.set_shape([None, None, 3])
+    return image
+
+
+def _parse_annotation_numpy(annotation_line_tensor):
+    """Parse annotation line using NumPy (called via tf.py_function)."""
+    # Convert tensor to string
+    if hasattr(annotation_line_tensor, 'numpy'):
+        annotation_line = annotation_line_tensor.numpy().decode('utf-8')
+    elif isinstance(annotation_line_tensor, bytes):
+        annotation_line = annotation_line_tensor.decode('utf-8')
+    else:
+        annotation_line = str(annotation_line_tensor)
+    
+    parts = annotation_line.split(' ', 1)
+    image_path = parts[0]
+    boxes_string = parts[1] if len(parts) > 1 else ''
+    return image_path.encode('utf-8'), boxes_string.encode('utf-8')
+
+def tf_parse_annotation_line(annotation_line: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Parse annotation line to extract image path and boxes.
+    
+    Args:
+        annotation_line: Tensor containing annotation line string (scalar)
+        
+    Returns:
+        Tuple of (image_path, boxes_string)
+    """
+    # Use py_function for safe parsing
+    image_path_bytes, boxes_string_bytes = tf.py_function(
+        func=_parse_annotation_numpy,
+        inp=[annotation_line],
+        Tout=[tf.string, tf.string]
+    )
+    image_path_bytes.set_shape([])
+    boxes_string_bytes.set_shape([])
+    return image_path_bytes, boxes_string_bytes
+
+
+def tf_parse_boxes(boxes_string: tf.Tensor) -> tf.Tensor:
+    """
+    Parse boxes from string format "x1,y1,x2,y2,class x1,y1,x2,y2,class ..."
+    
+    Args:
+        boxes_string: Tensor containing boxes string
+        
+    Returns:
+        Boxes tensor of shape (N, 5) with dtype float32
+    """
+    def _parse_boxes_numpy(box_str):
+        if box_str == b'':
+            return np.zeros((0, 5), dtype=np.float32)
+        box_list = []
+        for box in box_str.decode('utf-8').split():
+            coords = [float(x) for x in box.split(',')]
+            if len(coords) == 5:
+                box_list.append(coords)
+        if len(box_list) == 0:
+            return np.zeros((0, 5), dtype=np.float32)
+        return np.array(box_list, dtype=np.float32)
+    
+    boxes = tf.numpy_function(_parse_boxes_numpy, [boxes_string], tf.float32)
+    boxes.set_shape([None, 5])
+    return boxes
+
+
+def tf_letterbox_resize(image: tf.Tensor, target_size: Tuple[int, int], 
+                        return_padding_info: bool = False):
+    """
+    Resize image with letterbox padding using TensorFlow operations.
+    
+    Args:
+        image: Image tensor of shape (H, W, 3)
+        target_size: Target size (height, width)
+        return_padding_info: Whether to return padding info
+        
+    Returns:
+        Resized image tensor or tuple with padding info
+    """
+    target_h, target_w = target_size
+    image_shape = tf.shape(image)
+    src_h = tf.cast(image_shape[0], tf.float32)
+    src_w = tf.cast(image_shape[1], tf.float32)
+    
+    # Calculate scale
+    scale = tf.minimum(tf.cast(target_w, tf.float32) / src_w, 
+                      tf.cast(target_h, tf.float32) / src_h)
+    
+    # Calculate new size
+    new_w = tf.cast(src_w * scale, tf.int32)
+    new_h = tf.cast(src_h * scale, tf.int32)
+    
+    # Resize image
+    image_resized = tf.image.resize(image, [new_h, new_w], method='bicubic')
+    
+    # Calculate padding offsets
+    pad_w = target_w - new_w
+    pad_h = target_h - new_h
+    pad_left = pad_w // 2
+    pad_top = pad_h // 2
+    
+    # Pad image
+    image_padded = tf.image.pad_to_bounding_box(
+        image_resized, pad_top, pad_left, target_h, target_w
+    )
+    
+    if return_padding_info:
+        return image_padded, (new_w, new_h), (pad_left, pad_top)
+    return image_padded
+
+
+def tf_normalize_image(image: tf.Tensor) -> tf.Tensor:
+    """
+    Normalize image to [0, 1] range.
+    
+    Args:
+        image: Image tensor of dtype uint8
+        
+    Returns:
+        Normalized image tensor of dtype float32
+    """
+    image = tf.cast(image, tf.float32)
+    image = image / 255.0
+    return image
+
+
+def tf_random_horizontal_flip(image: tf.Tensor, boxes: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Randomly flip image and boxes horizontally.
+    
+    Args:
+        image: Image tensor of shape (H, W, 3)
+        boxes: Boxes tensor of shape (N, 5) in format (x1, y1, x2, y2, class)
+        
+    Returns:
+        Tuple of (flipped_image, flipped_boxes)
+    """
+    image_shape = tf.shape(image)
+    image_width = tf.cast(image_shape[1], tf.float32)
+    
+    # Random flip
+    should_flip = tf.random.uniform([]) > 0.5
+    image = tf.cond(should_flip, 
+                   lambda: tf.image.flip_left_right(image),
+                   lambda: image)
+    
+    # Flip boxes
+    def flip_boxes(boxes, width):
+        x1 = width - boxes[:, 2]
+        x2 = width - boxes[:, 0]
+        return tf.stack([x1, boxes[:, 1], x2, boxes[:, 3], boxes[:, 4]], axis=1)
+    
+    boxes = tf.cond(should_flip,
+                   lambda: flip_boxes(boxes, image_width),
+                   lambda: boxes)
+    
+    return image, boxes
+
+
+def tf_random_brightness(image: tf.Tensor, max_delta: float = 0.2) -> tf.Tensor:
+    """Apply random brightness adjustment."""
+    return tf.image.random_brightness(image, max_delta=max_delta)
+
+
+def tf_random_contrast(image: tf.Tensor, lower: float = 0.8, upper: float = 1.2) -> tf.Tensor:
+    """Apply random contrast adjustment."""
+    return tf.image.random_contrast(image, lower=lower, upper=upper)
+
+
+def tf_random_saturation(image: tf.Tensor, lower: float = 0.8, upper: float = 1.2) -> tf.Tensor:
+    """Apply random saturation adjustment."""
+    return tf.image.random_saturation(image, lower=lower, upper=upper)
+
+
+def tf_random_hue(image: tf.Tensor, max_delta: float = 0.1) -> tf.Tensor:
+    """Apply random hue adjustment."""
+    return tf.image.random_hue(image, max_delta=max_delta)
+
+
+def tf_random_grayscale(image: tf.Tensor, probability: float = 0.1) -> tf.Tensor:
+    """
+    Randomly convert image to grayscale.
+    
+    Args:
+        image: Image tensor
+        probability: Probability of converting to grayscale
+        
+    Returns:
+        Image tensor (possibly grayscale)
+    """
+    def to_grayscale(img):
+        gray = tf.image.rgb_to_grayscale(img)
+        return tf.image.grayscale_to_rgb(gray)
+    
+    should_convert = tf.random.uniform([]) < probability
+    return tf.cond(should_convert, lambda: to_grayscale(image), lambda: image)
+
+
 @tf.function
 def tf_iol_common_center(anchors: tf.Tensor, obj_boxes_wh: tf.Tensor) -> tf.Tensor:
     """
@@ -334,6 +549,181 @@ class MultiGridDataGenerator(Sequence):
         """Called at the end of each epoch."""
         if self.shuffle:
             np.random.shuffle(self.annotation_lines)
+    
+    def build_tf_dataset(self, prefetch_buffer_size=tf.data.AUTOTUNE, 
+                        num_parallel_calls=tf.data.AUTOTUNE,
+                        use_gpu_preprocessing: bool = True):
+        """
+        Build native tf.data.Dataset pipeline for GPU-accelerated data loading.
+        
+        This creates a true tf.data pipeline that can be parallelized and run on GPU,
+        unlike from_generator() which still runs Python code on CPU.
+        
+        Args:
+            prefetch_buffer_size: Number of batches to prefetch. Use tf.data.AUTOTUNE for automatic tuning.
+            num_parallel_calls: Number of parallel calls for map operations. Use tf.data.AUTOTUNE for automatic tuning.
+            use_gpu_preprocessing: Whether to use GPU-accelerated preprocessing (default: True)
+            
+        Returns:
+            tf.data.Dataset configured with prefetching and parallel processing
+        """
+        AUTOTUNE = tf.data.AUTOTUNE
+        
+        # Create dataset from annotation lines
+        annotation_paths = tf.constant(self.annotation_lines)
+        dataset = tf.data.Dataset.from_tensor_slices(annotation_paths)
+        
+        # Shuffle dataset
+        if self.shuffle:
+            dataset = dataset.shuffle(buffer_size=min(1000, len(self.annotation_lines)), 
+                                     reshuffle_each_iteration=True)
+        
+        # Parse annotation and load image
+        def _load_and_parse(annotation_line):
+            image_path, boxes_string = tf_parse_annotation_line(annotation_line)
+            image = tf_load_and_decode_image(image_path)
+            boxes = tf_parse_boxes(boxes_string)
+            return image, boxes, image_path
+        
+        dataset = dataset.map(_load_and_parse, num_parallel_calls=num_parallel_calls)
+        
+        # Preprocess and augment
+        def _preprocess_image_and_boxes(image, boxes, image_path):
+            # Get target shape (handle multi-scale if needed)
+            target_shape = self.input_shape
+            
+            # Convert image to float32 and normalize
+            image = tf.cast(image, tf.float32) / 255.0
+            
+            # Apply letterbox resize
+            image_resized = tf_letterbox_resize(image, target_shape, return_padding_info=False)
+            
+            # Apply augmentations if enabled
+            if self.augment:
+                # Random horizontal flip
+                image_resized, boxes = tf_random_horizontal_flip(image_resized, boxes)
+                
+                # Color augmentations
+                image_resized = tf_random_brightness(image_resized, max_delta=0.2)
+                image_resized = tf_random_contrast(image_resized, lower=0.8, upper=1.2)
+                image_resized = tf_random_saturation(image_resized, lower=0.8, upper=1.2)
+                image_resized = tf_random_hue(image_resized, max_delta=0.1)
+                image_resized = tf_random_grayscale(image_resized, probability=0.1)
+            
+            return image_resized, boxes
+        
+        dataset = dataset.map(_preprocess_image_and_boxes, num_parallel_calls=num_parallel_calls)
+        
+        # Batch the dataset - use padded_batch to handle variable-length boxes
+        # This automatically pads boxes to the same length in the batch
+        padded_shapes = (
+            [self.input_shape[0], self.input_shape[1], 3],  # image shape
+            [None, 5]  # boxes shape (variable length, will be padded)
+        )
+        padding_values = (
+            0.0,  # image padding (shouldn't be needed, but just in case)
+            0.0   # box padding value
+        )
+        dataset = dataset.padded_batch(
+            self.batch_size, 
+            padded_shapes=padded_shapes,
+            padding_values=padding_values,
+            drop_remainder=False
+        )
+        
+        # Process batches: pad boxes, create targets
+        # Capture anchors and other attributes for use in py_function
+        anchors_np = [np.array(anchor) if isinstance(anchor, tf.Tensor) else np.array(anchor) 
+                     for anchor in self.anchors]
+        input_shape_np = self.input_shape
+        num_classes_np = self.num_classes
+        multi_anchor_assign_np = self.multi_anchor_assign
+        grid_shapes_np = self.grid_shapes
+        
+        def _process_batch_numpy(images_tensor, boxes_tensor):
+            """
+            Process batch using NumPy operations (for preprocess_true_boxes).
+            This will be called via tf.py_function.
+            """
+            # Convert tensors to numpy
+            if hasattr(images_tensor, 'numpy'):
+                images_np = images_tensor.numpy()
+            else:
+                images_np = np.array(images_tensor)
+            
+            if hasattr(boxes_tensor, 'numpy'):
+                boxes_dense = boxes_tensor.numpy()
+            else:
+                boxes_dense = np.array(boxes_tensor)
+            
+            batch_size = images_np.shape[0]
+            
+            # boxes_dense is a dense numpy array of shape (batch_size, max_boxes, 5)
+            # Remove padding (boxes with all zeros are padding)
+            boxes_padded = boxes_dense.copy()
+            
+            # Find actual number of boxes per image (non-zero boxes)
+            for i in range(batch_size):
+                # Find last non-zero box
+                non_zero_mask = np.any(boxes_padded[i] != 0, axis=1)
+                if np.any(non_zero_mask):
+                    # Keep only non-zero boxes, but maintain max_boxes shape
+                    # The padding is already there, just ensure we don't process zero boxes
+                    pass
+                else:
+                    # No boxes for this image, ensure at least one zero box
+                    boxes_padded[i, 0] = [0, 0, 0, 0, 0]
+            
+            # Use existing preprocess_true_boxes function
+            y_true = preprocess_true_boxes(
+                boxes_padded, input_shape_np, 
+                anchors_np,
+                num_classes_np, multi_anchor_assign_np, 
+                grid_shapes=grid_shapes_np
+            )
+            
+            return images_np, *y_true, np.zeros(batch_size, dtype=np.float32)
+        
+        # Use py_function for complex batch processing
+        def _process_batch_wrapper(images, boxes_dense):
+            # boxes_dense is already converted to dense tensor in previous map operation
+            
+            # Get output types - need to return tuple structure
+            num_y_true = len(self.anchors)
+            num_outputs = 1 + num_y_true + 1  # images + y_true layers + dummy
+            
+            # Process batch - pass boxes as dense tensor
+            results = tf.py_function(
+                func=_process_batch_numpy,
+                inp=[images, boxes_dense],
+                Tout=[tf.float32] * num_outputs
+            )
+            
+            # Unpack results
+            images_processed = results[0]
+            y_true_list = results[1:1+num_y_true]
+            dummy_targets = results[-1]
+            
+            # Set shapes - critical for tf.py_function outputs
+            images_processed.set_shape([None, self.input_shape[0], self.input_shape[1], 3])
+            dummy_targets.set_shape([None])
+            
+            # Set shapes for y_true tensors based on grid_shapes
+            for i, y_true in enumerate(y_true_list):
+                grid_h, grid_w = self.grid_shapes[i]
+                num_anchors = len(self.anchors[i])
+                # Shape: (batch, grid_h, grid_w, 5 + num_anchors + num_classes)
+                y_true.set_shape([None, grid_h, grid_w, 5 + num_anchors + self.num_classes])
+            
+            # Return in format expected by model: (inputs_tuple, targets)
+            return (images_processed, *y_true_list), dummy_targets
+        
+        dataset = dataset.map(_process_batch_wrapper, num_parallel_calls=num_parallel_calls)
+        
+        # Prefetch for GPU overlap
+        dataset = dataset.prefetch(prefetch_buffer_size)
+        
+        return dataset
     
     def to_tf_dataset(self, prefetch_buffer_size=tf.data.AUTOTUNE, num_parallel_calls=None):
         """

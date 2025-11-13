@@ -117,7 +117,8 @@ class MultiGridTrainer:
         self.use_tf_dataset = data_loader_config.get('use_tf_dataset', True)
         
         if self.use_tf_dataset:
-            # Convert generators to tf.data.Dataset for better GPU utilization
+            # Build native tf.data.Dataset pipeline for GPU-accelerated data loading
+            use_gpu_preprocessing = data_loader_config.get('use_gpu_preprocessing', True)
             prefetch_buffer = data_loader_config.get('prefetch_buffer', 'auto')
             if prefetch_buffer == 'auto' or prefetch_buffer is None:
                 prefetch_buffer = tf.data.AUTOTUNE
@@ -130,16 +131,30 @@ class MultiGridTrainer:
             elif isinstance(num_parallel_calls, str) and num_parallel_calls.lower() == 'auto':
                 num_parallel_calls = tf.data.AUTOTUNE
             
-            print("[INFO] Converting generators to tf.data.Dataset for optimized GPU utilization...")
-            self.train_dataset = self.train_generator.to_tf_dataset(
-                prefetch_buffer_size=prefetch_buffer,
-                num_parallel_calls=num_parallel_calls
-            )
-            self.val_dataset = self.val_generator.to_tf_dataset(
-                prefetch_buffer_size=prefetch_buffer,
-                num_parallel_calls=num_parallel_calls
-            )
-            print("✓ tf.data.Dataset created with prefetching enabled")
+            if use_gpu_preprocessing:
+                print("[INFO] Building native tf.data.Dataset pipeline with GPU-accelerated preprocessing...")
+                self.train_dataset = self.train_generator.build_tf_dataset(
+                    prefetch_buffer_size=prefetch_buffer,
+                    num_parallel_calls=num_parallel_calls,
+                    use_gpu_preprocessing=True
+                )
+                self.val_dataset = self.val_generator.build_tf_dataset(
+                    prefetch_buffer_size=prefetch_buffer,
+                    num_parallel_calls=num_parallel_calls,
+                    use_gpu_preprocessing=True
+                )
+                print("✓ Native tf.data.Dataset pipeline created with GPU preprocessing")
+            else:
+                print("[INFO] Converting generators to tf.data.Dataset (legacy mode)...")
+                self.train_dataset = self.train_generator.to_tf_dataset(
+                    prefetch_buffer_size=prefetch_buffer,
+                    num_parallel_calls=num_parallel_calls
+                )
+                self.val_dataset = self.val_generator.to_tf_dataset(
+                    prefetch_buffer_size=prefetch_buffer,
+                    num_parallel_calls=num_parallel_calls
+                )
+                print("✓ tf.data.Dataset created with prefetching enabled")
         else:
             print("✓ Using Sequence generators (tf.data.Dataset disabled)")
         
