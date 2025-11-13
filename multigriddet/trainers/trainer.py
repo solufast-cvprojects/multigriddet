@@ -119,28 +119,52 @@ class MultiGridTrainer:
         if self.use_tf_dataset:
             # Build native tf.data.Dataset pipeline for GPU-accelerated data loading
             use_gpu_preprocessing = data_loader_config.get('use_gpu_preprocessing', True)
-            prefetch_buffer = data_loader_config.get('prefetch_buffer', 'auto')
-            if prefetch_buffer == 'auto' or prefetch_buffer is None:
-                prefetch_buffer = tf.data.AUTOTUNE
-            elif isinstance(prefetch_buffer, str) and prefetch_buffer.lower() == 'auto':
-                prefetch_buffer = tf.data.AUTOTUNE
+            prefetch_buffer_config = data_loader_config.get('prefetch_buffer', 'auto')
             
-            num_parallel_calls = data_loader_config.get('num_parallel_calls', 'auto')
-            if num_parallel_calls == 'auto' or num_parallel_calls is None:
+            # Handle prefetch buffer: can be 'auto', integer (batches), or None
+            if prefetch_buffer_config == 'auto' or prefetch_buffer_config is None:
+                prefetch_batches = 6  # Default: 6 batches for good GPU-CPU overlap
+            elif isinstance(prefetch_buffer_config, str) and prefetch_buffer_config.lower() == 'auto':
+                prefetch_batches = 6
+            elif isinstance(prefetch_buffer_config, (int, float)):
+                prefetch_batches = int(prefetch_buffer_config)
+            else:
+                prefetch_batches = 6
+            
+            num_parallel_calls_config = data_loader_config.get('num_parallel_calls', 'auto')
+            if num_parallel_calls_config == 'auto' or num_parallel_calls_config is None:
                 num_parallel_calls = tf.data.AUTOTUNE
-            elif isinstance(num_parallel_calls, str) and num_parallel_calls.lower() == 'auto':
+            elif isinstance(num_parallel_calls_config, str) and num_parallel_calls_config.lower() == 'auto':
+                num_parallel_calls = tf.data.AUTOTUNE
+            elif isinstance(num_parallel_calls_config, (int, float)):
+                num_parallel_calls = int(num_parallel_calls_config)
+            else:
                 num_parallel_calls = tf.data.AUTOTUNE
             
             if use_gpu_preprocessing:
+                # Get additional optimization parameters
+                shuffle_buffer_size = data_loader_config.get('shuffle_buffer_size', 4096)
+                interleave_cycle_length = data_loader_config.get('interleave_cycle_length', None)
+                
                 print("[INFO] Building native tf.data.Dataset pipeline with GPU-accelerated preprocessing...")
+                print(f"   Prefetch buffer: {prefetch_batches} batches")
+                print(f"   Parallel calls: {num_parallel_calls if num_parallel_calls != tf.data.AUTOTUNE else 'AUTOTUNE'}")
+                print(f"   Shuffle buffer: {shuffle_buffer_size}")
+                if interleave_cycle_length:
+                    print(f"   Interleave cycle length: {interleave_cycle_length}")
+                
                 self.train_dataset = self.train_generator.build_tf_dataset(
-                    prefetch_buffer_size=prefetch_buffer,
+                    prefetch_buffer_size=prefetch_batches,
                     num_parallel_calls=num_parallel_calls,
+                    shuffle_buffer_size=shuffle_buffer_size,
+                    interleave_cycle_length=interleave_cycle_length,
                     use_gpu_preprocessing=True
                 )
                 self.val_dataset = self.val_generator.build_tf_dataset(
-                    prefetch_buffer_size=prefetch_buffer,
+                    prefetch_buffer_size=prefetch_batches,
                     num_parallel_calls=num_parallel_calls,
+                    shuffle_buffer_size=shuffle_buffer_size,
+                    interleave_cycle_length=None,  # No interleaving for validation
                     use_gpu_preprocessing=True
                 )
                 print("✓ Native tf.data.Dataset pipeline created with GPU preprocessing")

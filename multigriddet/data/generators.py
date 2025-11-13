@@ -552,6 +552,8 @@ class MultiGridDataGenerator(Sequence):
     
     def build_tf_dataset(self, prefetch_buffer_size=tf.data.AUTOTUNE, 
                         num_parallel_calls=tf.data.AUTOTUNE,
+                        shuffle_buffer_size: int = 4096,
+                        interleave_cycle_length: int = None,
                         use_gpu_preprocessing: bool = True):
         """
         Build native tf.data.Dataset pipeline for GPU-accelerated data loading.
@@ -562,6 +564,8 @@ class MultiGridDataGenerator(Sequence):
         Args:
             prefetch_buffer_size: Number of batches to prefetch. Use tf.data.AUTOTUNE for automatic tuning.
             num_parallel_calls: Number of parallel calls for map operations. Use tf.data.AUTOTUNE for automatic tuning.
+            shuffle_buffer_size: Size of shuffle buffer (default: 4096, larger = better randomization)
+            interleave_cycle_length: Number of files to interleave for parallel reading (None = no interleaving)
             use_gpu_preprocessing: Whether to use GPU-accelerated preprocessing (default: True)
             
         Returns:
@@ -573,19 +577,44 @@ class MultiGridDataGenerator(Sequence):
         annotation_paths = tf.constant(self.annotation_lines)
         dataset = tf.data.Dataset.from_tensor_slices(annotation_paths)
         
-        # Shuffle dataset
+        # Shuffle dataset with larger buffer for better randomization (before loading files)
         if self.shuffle:
-            dataset = dataset.shuffle(buffer_size=min(1000, len(self.annotation_lines)), 
+            # Use provided shuffle_buffer_size, but cap at dataset size
+            buffer_size = min(shuffle_buffer_size, len(self.annotation_lines))
+            dataset = dataset.shuffle(buffer_size=buffer_size, 
                                      reshuffle_each_iteration=True)
         
-        # Parse annotation and load image
-        def _load_and_parse(annotation_line):
-            image_path, boxes_string = tf_parse_annotation_line(annotation_line)
-            image = tf_load_and_decode_image(image_path)
-            boxes = tf_parse_boxes(boxes_string)
-            return image, boxes, image_path
-        
-        dataset = dataset.map(_load_and_parse, num_parallel_calls=num_parallel_calls)
+        # Add interleaving for parallel file reading if specified
+        if interleave_cycle_length is not None and interleave_cycle_length > 1:
+            # Interleave file reading for parallel I/O
+            # This creates multiple parallel readers that interleave their results
+            def _load_and_parse(annotation_line):
+                image_path, boxes_string = tf_parse_annotation_line(annotation_line)
+                image = tf_load_and_decode_image(image_path)
+                boxes = tf_parse_boxes(boxes_string)
+                return image, boxes, image_path
+            
+            # For interleave, num_parallel_calls must be <= cycle_length or AUTOTUNE
+            # Use AUTOTUNE for interleave to maximize parallelism
+            interleave_parallel_calls = tf.data.AUTOTUNE
+            
+            # Interleave for parallel I/O - creates cycle_length parallel readers
+            dataset = dataset.interleave(
+                lambda x: tf.data.Dataset.from_tensors(x).map(_load_and_parse),
+                cycle_length=interleave_cycle_length,
+                num_parallel_calls=interleave_parallel_calls,
+                deterministic=False
+            )
+        else:
+            # Standard approach without interleaving
+            # Parse annotation and load image
+            def _load_and_parse(annotation_line):
+                image_path, boxes_string = tf_parse_annotation_line(annotation_line)
+                image = tf_load_and_decode_image(image_path)
+                boxes = tf_parse_boxes(boxes_string)
+                return image, boxes, image_path
+            
+            dataset = dataset.map(_load_and_parse, num_parallel_calls=num_parallel_calls)
         
         # Preprocess and augment
         def _preprocess_image_and_boxes(image, boxes, image_path):

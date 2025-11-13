@@ -11,14 +11,16 @@ data:
 data_loader:
   use_tf_dataset: true          # Use tf.data.Dataset for better GPU utilization (recommended)
   use_gpu_preprocessing: true    # Use GPU-accelerated preprocessing pipeline (recommended for A100)
-  prefetch_buffer: auto          # Prefetch buffer size: 'auto' (uses AUTOTUNE), or integer
-  num_parallel_calls: auto      # Parallel calls for preprocessing: 'auto' (uses AUTOTUNE), or integer
+  prefetch_buffer: 6             # Prefetch buffer in batches (6 = good GPU-CPU overlap, 'auto' uses AUTOTUNE)
+  num_parallel_calls: 24         # Parallel calls for preprocessing (24 = aggressive, 'auto' uses AUTOTUNE)
+  shuffle_buffer_size: 8192      # Shuffle buffer size (larger = better randomization, default: 4096)
+  interleave_cycle_length: 16    # Parallel file reading (16 = good I/O overlap, None = disabled)
   num_workers: 8                 # Number of CPU worker threads for data loading (legacy mode only)
   cache_images: false            # Cache decoded images in memory (optional, uses more RAM)
   
 # Training parameters
 training:
-  batch_size: 16
+  batch_size: 8
   epochs: 100
   initial_epoch: 0
   learning_rate: 0.001
