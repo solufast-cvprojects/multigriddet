@@ -6,6 +6,13 @@ data:
   train_annotation: data/coco_train2017.txt
   val_annotation: data/coco_val2017.txt
   classes_path: configs/coco_classes.txt
+
+# Data loader configuration (for GPU optimization)
+data_loader:
+  use_tf_dataset: true          # Use tf.data.Dataset for better GPU utilization (recommended)
+  prefetch_buffer: auto          # Prefetch buffer size: 'auto' (uses AUTOTUNE), or integer
+  num_parallel_calls: auto      # Parallel calls for preprocessing: 'auto' (uses AUTOTUNE), or integer
+  num_workers: 8                 # Number of CPU worker threads for data loading
   
 # Training parameters
 training:

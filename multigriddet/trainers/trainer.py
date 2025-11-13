@@ -33,6 +33,9 @@ class MultiGridTrainer:
         self.model = None
         self.train_generator = None
         self.val_generator = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.use_tf_dataset = True  # Default to using tf.data.Dataset
         self.callbacks = []
         
         # Initialize TensorFlow optimizations
@@ -76,6 +79,10 @@ class MultiGridTrainer:
         # Get input shape
         input_shape = tuple(self.model_config['model']['preset']['input_shape'][:2])
         
+        # Get data loader config for num_workers
+        data_loader_config = self.config.get('data_loader', {})
+        num_workers = data_loader_config.get('num_workers', 8)
+        
         # Create training generator
         augment_config = training_config.get('augmentation', {})
         self.train_generator = MultiGridDataGenerator(
@@ -88,7 +95,8 @@ class MultiGridTrainer:
             enhance_augment=augment_config.get('enhance_type'),
             rescale_interval=augment_config.get('rescale_interval', -1),
             multi_anchor_assign=training_config.get('multi_anchor_assign', False),
-            shuffle=True
+            shuffle=True,
+            num_workers=num_workers
         )
         
         # Create validation generator
@@ -100,8 +108,40 @@ class MultiGridTrainer:
             num_classes=num_classes,
             augment=False,
             multi_anchor_assign=training_config.get('multi_anchor_assign', False),
-            shuffle=False
+            shuffle=False,
+            num_workers=num_workers
         )
+        
+        # Check if we should use tf.data.Dataset (default: True)
+        # data_loader_config already loaded above
+        self.use_tf_dataset = data_loader_config.get('use_tf_dataset', True)
+        
+        if self.use_tf_dataset:
+            # Convert generators to tf.data.Dataset for better GPU utilization
+            prefetch_buffer = data_loader_config.get('prefetch_buffer', 'auto')
+            if prefetch_buffer == 'auto' or prefetch_buffer is None:
+                prefetch_buffer = tf.data.AUTOTUNE
+            elif isinstance(prefetch_buffer, str) and prefetch_buffer.lower() == 'auto':
+                prefetch_buffer = tf.data.AUTOTUNE
+            
+            num_parallel_calls = data_loader_config.get('num_parallel_calls', 'auto')
+            if num_parallel_calls == 'auto' or num_parallel_calls is None:
+                num_parallel_calls = tf.data.AUTOTUNE
+            elif isinstance(num_parallel_calls, str) and num_parallel_calls.lower() == 'auto':
+                num_parallel_calls = tf.data.AUTOTUNE
+            
+            print("[INFO] Converting generators to tf.data.Dataset for optimized GPU utilization...")
+            self.train_dataset = self.train_generator.to_tf_dataset(
+                prefetch_buffer_size=prefetch_buffer,
+                num_parallel_calls=num_parallel_calls
+            )
+            self.val_dataset = self.val_generator.to_tf_dataset(
+                prefetch_buffer_size=prefetch_buffer,
+                num_parallel_calls=num_parallel_calls
+            )
+            print("✓ tf.data.Dataset created with prefetching enabled")
+        else:
+            print("✓ Using Sequence generators (tf.data.Dataset disabled)")
         
         print("✓ Data generators created successfully\n")
         
@@ -240,11 +280,16 @@ class MultiGridTrainer:
             # No recompilation needed in Keras 3.x - model is already compiled
             
             # Train stage 1
+            train_data = self.train_dataset if self.use_tf_dataset else self.train_generator
+            val_data = self.val_dataset if self.use_tf_dataset else self.val_generator
+            steps_per_epoch = max(1, len(self.train_generator))
+            validation_steps = max(1, len(self.val_generator))
+            
             self.model.fit(
-                self.train_generator,
-                steps_per_epoch=max(1, len(self.train_generator)),
-                validation_data=self.val_generator,
-                validation_steps=max(1, len(self.val_generator)),
+                train_data,
+                steps_per_epoch=steps_per_epoch,
+                validation_data=val_data,
+                validation_steps=validation_steps,
                 epochs=transfer_epochs,
                 initial_epoch=initial_epoch,
                 callbacks=self.callbacks,
@@ -262,11 +307,16 @@ class MultiGridTrainer:
         
         # Train full model
         print(f"[INFO] Training full model...")
+        train_data = self.train_dataset if self.use_tf_dataset else self.train_generator
+        val_data = self.val_dataset if self.use_tf_dataset else self.val_generator
+        steps_per_epoch = max(1, len(self.train_generator))
+        validation_steps = max(1, len(self.val_generator))
+        
         history = self.model.fit(
-            self.train_generator,
-            steps_per_epoch=max(1, len(self.train_generator)),
-            validation_data=self.val_generator,
-            validation_steps=max(1, len(self.val_generator)),
+            train_data,
+            steps_per_epoch=steps_per_epoch,
+            validation_data=val_data,
+            validation_steps=validation_steps,
             epochs=epochs,
             initial_epoch=initial_epoch,
             callbacks=self.callbacks,

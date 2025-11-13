@@ -156,7 +156,7 @@ class MultiGridDataGenerator(Sequence):
                  multi_anchor_assign: bool = False,
                  shuffle: bool = True,
                  prefetch_factor: int = 2,
-                 num_workers: int = 4,
+                 num_workers: int = 8,
                  **kwargs):
         """
         Initialize the optimized data generator.
@@ -334,6 +334,83 @@ class MultiGridDataGenerator(Sequence):
         """Called at the end of each epoch."""
         if self.shuffle:
             np.random.shuffle(self.annotation_lines)
+    
+    def to_tf_dataset(self, prefetch_buffer_size=tf.data.AUTOTUNE, num_parallel_calls=None):
+        """
+        Convert Sequence generator to tf.data.Dataset for better GPU utilization.
+        
+        Args:
+            prefetch_buffer_size: Number of batches to prefetch. Use tf.data.AUTOTUNE for automatic tuning.
+            num_parallel_calls: Number of parallel calls for map operations. Use tf.data.AUTOTUNE for automatic tuning.
+            
+        Returns:
+            tf.data.Dataset configured with prefetching and parallel processing
+        """
+        # Create generator function that yields batches
+        # The generator returns ((image_data, *y_true), dummy_y) format
+        # Note: Keras will control epochs via steps_per_epoch, so we make this infinite
+        def generator():
+            batch_count = 0
+            while True:  # Infinite loop - Keras controls epochs via steps_per_epoch
+                # Shuffle at start of each epoch if needed
+                if batch_count % len(self) == 0 and self.shuffle:
+                    np.random.shuffle(self.indexes)
+                
+                # Get current batch index within epoch
+                i = batch_count % len(self)
+                batch = self[i]
+                # batch is ((image_data, *y_true), dummy_y)
+                # For model.fit(), we need (inputs, targets) where inputs = (image_data, *y_true)
+                inputs_tuple = batch[0]  # (image_data, *y_true)
+                dummy_target = batch[1]  # dummy_y (not used but required by Keras)
+                yield inputs_tuple, dummy_target
+                
+                batch_count += 1
+                
+                # Call on_epoch_end at the end of each epoch
+                if batch_count % len(self) == 0:
+                    self.on_epoch_end()
+        
+        # Get output types and shapes from a sample batch
+        sample_batch = self[0]
+        inputs_tuple = sample_batch[0]  # (image_data, *y_true)
+        dummy_y = sample_batch[1]
+        
+        images = inputs_tuple[0]
+        y_true_list = inputs_tuple[1:]
+        
+        # Define output types: (inputs_tuple, dummy_target)
+        # inputs_tuple is a tuple of (image, *y_true)
+        output_types = (
+            (tf.float32, *[tf.float32] * len(y_true_list)),  # inputs tuple
+            tf.float32  # dummy target
+        )
+        
+        # Define output shapes
+        output_shapes = (
+            (
+                tf.TensorShape([None] + list(images.shape[1:])),  # image shape
+                *[tf.TensorShape([None] + list(y.shape[1:])) for y in y_true_list]  # y_true shapes
+            ),
+            tf.TensorShape([None])  # dummy target shape
+        )
+        
+        # Create dataset from generator
+        dataset = tf.data.Dataset.from_generator(
+            generator,
+            output_types=output_types,
+            output_shapes=output_shapes
+        )
+        
+        # Configure parallel processing if specified
+        if num_parallel_calls is not None:
+            # Note: map operations would go here if we had preprocessing steps
+            pass
+        
+        # Prefetch to overlap CPU data preparation with GPU computation
+        dataset = dataset.prefetch(prefetch_buffer_size)
+        
+        return dataset
     
     def __del__(self):
         """Cleanup thread pool on deletion."""
