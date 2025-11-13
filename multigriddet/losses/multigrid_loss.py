@@ -558,13 +558,19 @@ class MultiGridLoss:
         """
         Compute MSE loss for localization (YOLOv3 style).
         
+        Applies tanh+sigmoid activation to pred_xy to match inference pipeline behavior.
+        
         Formula:
-        L_xy = Σ object_mask * (true_xy - pred_xy)²
+        pred_xy_activated = tanh(0.15 * pred_xy) + sigmoid(0.15 * pred_xy)
+        L_xy = Σ object_mask * (true_xy - pred_xy_activated)²
         L_wh = Σ object_mask * (true_wh - pred_wh)²
         L_location = L_xy + L_wh
         """
+        # Apply tanh+sigmoid activation to pred_xy to match inference pipeline
+        pred_xy_activated = tf.nn.tanh(0.15 * pred_xy) + tf.nn.sigmoid(0.15 * pred_xy)
+        
         # XY coordinate loss
-        xy_diff = true_xy - pred_xy
+        xy_diff = true_xy - pred_xy_activated
         xy_loss = K.sum(K.square(xy_diff), axis=-1, keepdims=True)  # [batch, grid_h, grid_w, 1]
         
         # WH size loss
