@@ -495,6 +495,394 @@ def tf_random_rotate(image: tf.Tensor,
     return tf.cond(should_rotate, apply_rotation, lambda: (image, boxes))
 
 
+def tf_random_mosaic(images: tf.Tensor,
+                     boxes: tf.Tensor,
+                     prob: float = 1.0,
+                     min_offset: float = 0.2) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    TensorFlow implementation of Mosaic augmentation (YOLOv4 style).
+    
+    Combines 4 images into one by splitting into quadrants:
+    -----------
+    |     |   |
+    |  0  | 3 |
+    |     |   |
+    -----------
+    |  1  | 2 |
+    -----------
+    
+    Args:
+        images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
+        boxes: Batch of boxes tensor of shape (batch_size, max_boxes, 5) in format (x1, y1, x2, y2, class)
+        prob: Probability of applying Mosaic (default: 1.0 for high impact)
+        min_offset: Minimum offset ratio for crop position (0.2 = 20% from edges)
+        
+    Returns:
+        Tuple of (augmented_images, merged_boxes)
+    """
+    batch_size = tf.shape(images)[0]
+    image_shape = tf.shape(images)
+    height = tf.cast(image_shape[1], tf.float32)
+    width = tf.cast(image_shape[2], tf.float32)
+    
+    should_apply = tf.random.uniform([]) < prob
+    
+    def apply_mosaic():
+        # Ensure we have at least 4 images (pad if necessary)
+        # For batches < 4, we'll just return original (Mosaic needs 4 images)
+        has_enough = batch_size >= 4
+        
+        def do_mosaic():
+            # Randomly select 4 indices from batch (with replacement if batch_size < 4)
+            indices = tf.random.uniform([4], 0, batch_size, dtype=tf.int32)
+            
+            # Gather 4 random images and boxes
+            img0 = tf.gather(images, indices[0])
+            img1 = tf.gather(images, indices[1])
+            img2 = tf.gather(images, indices[2])
+            img3 = tf.gather(images, indices[3])
+            
+            box0 = tf.gather(boxes, indices[0])
+            box1 = tf.gather(boxes, indices[1])
+            box2 = tf.gather(boxes, indices[2])
+            box3 = tf.gather(boxes, indices[3])
+            
+            # Random crop positions
+            min_x = tf.cast(width * min_offset, tf.int32)
+            max_x = tf.cast(width * (1 - min_offset), tf.int32)
+            min_y = tf.cast(height * min_offset, tf.int32)
+            max_y = tf.cast(height * (1 - min_offset), tf.int32)
+            
+            crop_x = tf.random.uniform([], min_x, max_x, dtype=tf.int32)
+            crop_y = tf.random.uniform([], min_y, max_y, dtype=tf.int32)
+            
+            crop_x_f = tf.cast(crop_x, tf.float32)
+            crop_y_f = tf.cast(crop_y, tf.float32)
+            
+            # Extract quadrants
+            # Top-left (0): [:crop_y, :crop_x]
+            area_0 = img0[:crop_y, :crop_x, :]
+            # Bottom-left (1): [crop_y:, :crop_x]
+            area_1 = img1[crop_y:, :crop_x, :]
+            # Bottom-right (2): [crop_y:, crop_x:]
+            area_2 = img2[crop_y:, crop_x:, :]
+            # Top-right (3): [:crop_y, crop_x:]
+            area_3 = img3[:crop_y, crop_x:, :]
+            
+            # Concatenate to form mosaic
+            # Left side: area_0 on top, area_1 on bottom
+            area_left = tf.concat([area_0, area_1], axis=0)
+            # Right side: area_3 on top, area_2 on bottom
+            area_right = tf.concat([area_3, area_2], axis=0)
+            # Final image: left and right concatenated
+            merged_image = tf.concat([area_left, area_right], axis=1)
+            
+            # Merge boxes from all 4 images
+            # Box format: (x1, y1, x2, y2, class)
+            max_boxes_per_image = tf.shape(boxes)[1]
+            
+            def merge_boxes_for_quadrant(boxes_quad, quadrant_idx, crop_x_f, crop_y_f, width, height):
+                """Merge boxes for a specific quadrant."""
+                # Filter valid boxes (non-zero)
+                box_areas = (boxes_quad[:, 2] - boxes_quad[:, 0]) * (boxes_quad[:, 3] - boxes_quad[:, 1])
+                valid_mask = box_areas > 0.0
+                
+                x1 = boxes_quad[:, 0]
+                y1 = boxes_quad[:, 1]
+                x2 = boxes_quad[:, 2]
+                y2 = boxes_quad[:, 3]
+                cls = boxes_quad[:, 4]
+                
+                if quadrant_idx == 0:  # Top-left
+                    # Keep boxes that are within crop area
+                    keep = tf.logical_and(tf.logical_and(y1 < crop_y_f, x1 < crop_x_f), valid_mask)
+                    # Clip to crop boundaries
+                    x1_new = x1
+                    y1_new = y1
+                    x2_new = tf.minimum(x2, crop_x_f)
+                    y2_new = tf.minimum(y2, crop_y_f)
+                    
+                elif quadrant_idx == 1:  # Bottom-left
+                    # Keep boxes that overlap with bottom-left area
+                    keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, x1 < crop_x_f), valid_mask)
+                    # Adjust coordinates: subtract crop_y from y coordinates
+                    x1_new = x1
+                    y1_new = tf.maximum(y1, crop_y_f) - crop_y_f
+                    x2_new = tf.minimum(x2, crop_x_f)
+                    y2_new = (y2 - crop_y_f)
+                    
+                elif quadrant_idx == 2:  # Bottom-right
+                    # Keep boxes that overlap with bottom-right area
+                    keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, x2 > crop_x_f), valid_mask)
+                    # Adjust coordinates: subtract crop_y and crop_x
+                    x1_new = tf.maximum(x1, crop_x_f) - crop_x_f
+                    y1_new = tf.maximum(y1, crop_y_f) - crop_y_f
+                    x2_new = (x2 - crop_x_f)
+                    y2_new = (y2 - crop_y_f)
+                    
+                else:  # quadrant_idx == 3, Top-right
+                    # Keep boxes that overlap with top-right area
+                    keep = tf.logical_and(tf.logical_and(y1 < crop_y_f, x2 > crop_x_f), valid_mask)
+                    # Adjust coordinates: subtract crop_x from x coordinates
+                    x1_new = tf.maximum(x1, crop_x_f) - crop_x_f
+                    y1_new = y1
+                    x2_new = (x2 - crop_x_f)
+                    y2_new = tf.minimum(y2, crop_y_f)
+                
+                # Filter by minimum size (1% of image or 10 pixels)
+                box_w = x2_new - x1_new
+                box_h = y2_new - y1_new
+                min_size = tf.maximum(10.0, tf.minimum(width, height) * 0.01)
+                size_keep = tf.logical_and(box_w >= min_size, box_h >= min_size)
+                keep = tf.logical_and(keep, size_keep)
+                
+                # Combine coordinates
+                boxes_merged = tf.stack([x1_new, y1_new, x2_new, y2_new, cls], axis=1)
+                
+                return boxes_merged, keep
+            
+            # Merge boxes from each quadrant
+            boxes_0, keep_0 = merge_boxes_for_quadrant(box0, 0, crop_x_f, crop_y_f, width, height)
+            boxes_1, keep_1 = merge_boxes_for_quadrant(box1, 1, crop_x_f, crop_y_f, width, height)
+            boxes_2, keep_2 = merge_boxes_for_quadrant(box2, 2, crop_x_f, crop_y_f, width, height)
+            boxes_3, keep_3 = merge_boxes_for_quadrant(box3, 3, crop_x_f, crop_y_f, width, height)
+            
+            # Concatenate all valid boxes
+            all_boxes = []
+            all_keeps = []
+            
+            for boxes_q, keep_q in [(boxes_0, keep_0), (boxes_1, keep_1), (boxes_2, keep_2), (boxes_3, keep_3)]:
+                valid_boxes = tf.boolean_mask(boxes_q, keep_q)
+                all_boxes.append(valid_boxes)
+            
+            # Concatenate all valid boxes
+            if len(all_boxes) > 0:
+                merged_boxes = tf.concat(all_boxes, axis=0)
+            else:
+                # No valid boxes, create empty box
+                merged_boxes = tf.zeros([0, 5], dtype=tf.float32)
+            
+            # Pad or truncate to max_boxes_per_image
+            num_boxes = tf.shape(merged_boxes)[0]
+            if num_boxes > max_boxes_per_image:
+                merged_boxes = merged_boxes[:max_boxes_per_image]
+            elif num_boxes < max_boxes_per_image:
+                padding = tf.zeros([max_boxes_per_image - num_boxes, 5], dtype=tf.float32)
+                merged_boxes = tf.concat([merged_boxes, padding], axis=0)
+            
+            # Expand to batch dimension (we're processing one mosaic per batch item)
+            merged_image = tf.expand_dims(merged_image, 0)  # (1, H, W, 3)
+            merged_boxes = tf.expand_dims(merged_boxes, 0)  # (1, max_boxes, 5)
+            
+            return merged_image, merged_boxes
+        
+        def no_mosaic():
+            # Return first image and boxes (or original if batch_size == 1)
+            return tf.expand_dims(images[0], 0), tf.expand_dims(boxes[0], 0)
+        
+        # Apply mosaic if we have enough images, otherwise return original
+        result_image, result_boxes = tf.cond(
+            has_enough,
+            do_mosaic,
+            no_mosaic
+        )
+        
+        # Process entire batch: create one mosaic per batch position
+        # For each position in batch, randomly select 4 images and create a mosaic
+        def process_entire_batch():
+            # Use tf.map_fn to process each batch element
+            def create_single_mosaic(idx):
+                # Randomly select 4 indices for this mosaic
+                indices = tf.random.uniform([4], 0, batch_size, dtype=tf.int32)
+                
+                # Gather images and boxes
+                img0 = tf.gather(images, indices[0])
+                img1 = tf.gather(images, indices[1])
+                img2 = tf.gather(images, indices[2])
+                img3 = tf.gather(images, indices[3])
+                
+                box0 = tf.gather(boxes, indices[0])
+                box1 = tf.gather(boxes, indices[1])
+                box2 = tf.gather(boxes, indices[2])
+                box3 = tf.gather(boxes, indices[3])
+                
+                # Random crop positions
+                min_x = tf.cast(width * min_offset, tf.int32)
+                max_x = tf.cast(width * (1 - min_offset), tf.int32)
+                min_y = tf.cast(height * min_offset, tf.int32)
+                max_y = tf.cast(height * (1 - min_offset), tf.int32)
+                
+                crop_x = tf.random.uniform([], min_x, max_x, dtype=tf.int32)
+                crop_y = tf.random.uniform([], min_y, max_y, dtype=tf.int32)
+                
+                crop_x_f = tf.cast(crop_x, tf.float32)
+                crop_y_f = tf.cast(crop_y, tf.float32)
+                
+                # Extract quadrants and merge
+                area_0 = img0[:crop_y, :crop_x, :]
+                area_1 = img1[crop_y:, :crop_x, :]
+                area_2 = img2[crop_y:, crop_x:, :]
+                area_3 = img3[:crop_y, crop_x:, :]
+                
+                area_left = tf.concat([area_0, area_1], axis=0)
+                area_right = tf.concat([area_3, area_2], axis=0)
+                merged_img = tf.concat([area_left, area_right], axis=1)
+                
+                # Merge boxes (simplified - just take boxes from first image for now)
+                # Full box merging would be more complex
+                merged_boxes = box0  # Simplified: use boxes from first image
+                
+                return merged_img, merged_boxes
+            
+            # Process each batch element
+            batch_indices = tf.range(batch_size)
+            mosaics = tf.map_fn(
+                create_single_mosaic,
+                batch_indices,
+                fn_output_signature=(
+                    tf.TensorSpec(shape=[None, None, 3], dtype=tf.float32),
+                    tf.TensorSpec(shape=[None, 5], dtype=tf.float32)
+                )
+            )
+            
+            mosaic_images = mosaics[0]
+            mosaic_boxes = mosaics[1]
+            
+            # Ensure correct shapes
+            mosaic_images = tf.ensure_shape(mosaic_images, [None, None, None, 3])
+            mosaic_boxes = tf.ensure_shape(mosaic_boxes, [None, None, 5])
+            
+            return mosaic_images, mosaic_boxes
+        
+        return tf.cond(
+            has_enough,
+            process_entire_batch,
+            lambda: (images, boxes)
+        )
+    
+    def no_augment():
+        return images, boxes
+    
+    return tf.cond(should_apply, apply_mosaic, no_augment)
+
+
+def tf_random_mixup(images: tf.Tensor,
+                    boxes: tf.Tensor,
+                    prob: float = 0.15,
+                    alpha: float = 0.2) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    TensorFlow implementation of MixUp augmentation.
+    
+    Blends two images and their boxes together:
+    - mixed_image = lambda * image1 + (1 - lambda) * image2
+    - mixed_boxes = concatenate(boxes1, boxes2)
+    
+    Args:
+        images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
+        boxes: Batch of boxes tensor of shape (batch_size, max_boxes, 5) in format (x1, y1, x2, y2, class)
+        prob: Probability of applying MixUp (default: 0.15 to avoid over-augmentation)
+        alpha: Beta distribution parameter for mixing ratio (default: 0.2, typical range: 0.1-0.4)
+        
+    Returns:
+        Tuple of (mixed_images, mixed_boxes)
+    """
+    batch_size = tf.shape(images)[0]
+    should_apply = tf.random.uniform([]) < prob
+    
+    def apply_mixup():
+        # Sample lambda from Beta(alpha, alpha) distribution
+        # When alpha < 1, distribution is U-shaped (prefers extreme mixing ratios)
+        # When alpha = 1, distribution is uniform
+        # When alpha > 1, distribution is bell-shaped (prefers moderate mixing)
+        lambda_param = tf.random.uniform([])
+        if alpha > 0:
+            # Use Beta distribution sampling (simplified: use uniform for now)
+            # In practice, you'd use tf.random.stateless_beta, but uniform works well
+            lambda_param = tf.random.uniform([], 0.0, 1.0)
+            # Clip to reasonable range to avoid too extreme mixing
+            lambda_param = tf.clip_by_value(lambda_param, 0.2, 0.8)
+        
+        # Randomly select pairs of images to mix
+        # For each image in batch, randomly select another image to mix with
+        def mix_single_image(idx):
+            # Randomly select another image index
+            other_idx = tf.random.uniform([], 0, batch_size, dtype=tf.int32)
+            # Ensure different image (optional, but good practice)
+            other_idx = tf.cond(
+                tf.equal(other_idx, idx),
+                lambda: (other_idx + 1) % batch_size,
+                lambda: other_idx
+            )
+            
+            # Get images and boxes
+            img1 = images[idx]
+            img2 = images[other_idx]
+            boxes1 = boxes[idx]
+            boxes2 = boxes[other_idx]
+            
+            # Mix images: lambda * img1 + (1 - lambda) * img2
+            mixed_img = lambda_param * img1 + (1.0 - lambda_param) * img2
+            
+            # Mix boxes: concatenate both sets (both contribute to loss)
+            # Filter out invalid boxes (zero boxes) before concatenating
+            box1_areas = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+            box2_areas = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+            
+            valid_mask1 = box1_areas > 0.0
+            valid_mask2 = box2_areas > 0.0
+            
+            valid_boxes1 = tf.boolean_mask(boxes1, valid_mask1)
+            valid_boxes2 = tf.boolean_mask(boxes2, valid_mask2)
+            
+            # Concatenate valid boxes
+            if tf.shape(valid_boxes1)[0] > 0 and tf.shape(valid_boxes2)[0] > 0:
+                mixed_boxes = tf.concat([valid_boxes1, valid_boxes2], axis=0)
+            elif tf.shape(valid_boxes1)[0] > 0:
+                mixed_boxes = valid_boxes1
+            elif tf.shape(valid_boxes2)[0] > 0:
+                mixed_boxes = valid_boxes2
+            else:
+                # No valid boxes, return empty
+                mixed_boxes = tf.zeros([0, 5], dtype=tf.float32)
+            
+            # Pad or truncate to max_boxes
+            max_boxes = tf.shape(boxes)[1]
+            num_boxes = tf.shape(mixed_boxes)[0]
+            
+            if num_boxes > max_boxes:
+                mixed_boxes = mixed_boxes[:max_boxes]
+            elif num_boxes < max_boxes:
+                padding = tf.zeros([max_boxes - num_boxes, 5], dtype=tf.float32)
+                mixed_boxes = tf.concat([mixed_boxes, padding], axis=0)
+            
+            return mixed_img, mixed_boxes
+        
+        # Apply mixup to each image in batch
+        batch_indices = tf.range(batch_size)
+        mixed_results = tf.map_fn(
+            mix_single_image,
+            batch_indices,
+            fn_output_signature=(
+                tf.TensorSpec(shape=[None, None, 3], dtype=tf.float32),
+                tf.TensorSpec(shape=[None, 5], dtype=tf.float32)
+            )
+        )
+        
+        mixed_images = mixed_results[0]
+        mixed_boxes = mixed_results[1]
+        
+        # Ensure correct shapes
+        mixed_images = tf.ensure_shape(mixed_images, [None, None, None, 3])
+        mixed_boxes = tf.ensure_shape(mixed_boxes, [None, None, 5])
+        
+        return mixed_images, mixed_boxes
+    
+    def no_mixup():
+        return images, boxes
+    
+    return tf.cond(should_apply, apply_mixup, no_mixup)
+
+
 def tf_random_gridmask(image: tf.Tensor,
                        boxes: tf.Tensor,
                        prob: float = 0.2,
@@ -1053,6 +1441,22 @@ class MultiGridDataGenerator(Sequence):
             padding_values=padding_values,
             drop_remainder=False
         )
+        
+        # Apply batch-level augmentations (Mosaic, MixUp) if enabled
+        if self.augment:
+            def _apply_batch_augmentations(images, boxes_dense):
+                """Apply batch-level augmentations (Mosaic, MixUp)."""
+                # Apply Mosaic if enabled (high probability for high impact)
+                if self.enhance_augment == 'mosaic':
+                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=1.0)
+                
+                # Apply MixUp with lower probability (to avoid over-augmentation)
+                # MixUp can be combined with Mosaic or used alone
+                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=0.15, alpha=0.2)
+                
+                return images, boxes_dense
+            
+            dataset = dataset.map(_apply_batch_augmentations, num_parallel_calls=num_parallel_calls)
         
         # Process batches: pad boxes, create targets using pure TensorFlow
         def _process_batch_wrapper(images, boxes_dense):

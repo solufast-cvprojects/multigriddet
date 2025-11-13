@@ -6,14 +6,80 @@ Builds models from YAML configuration.
 """
 
 import os
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input
+from tensorflow.keras.optimizers import Adam, AdamW, SGD
 
 from ..models import build_multigriddet_darknet, build_multigriddet_resnet
 from ..models.multigriddet_darknet import build_multigriddet_darknet_train
 from ..models.multigriddet_resnet import build_multigriddet_resnet_train
+
+
+def create_optimizer_from_config(config: Dict[str, Any]) -> tf.keras.optimizers.Optimizer:
+    """
+    Create optimizer from configuration.
+    
+    Supports:
+    - Adam: Basic Adam optimizer
+    - AdamW: Adam with decoupled weight decay (recommended for modern training)
+    - SGD: Stochastic Gradient Descent with momentum
+    
+    Args:
+        config: Configuration dictionary with 'optimizer' key
+        
+    Returns:
+        Configured optimizer instance
+    """
+    optimizer_config = config.get('optimizer', {})
+    opt_type = optimizer_config.get('type', 'adam').lower()
+    learning_rate = optimizer_config.get('learning_rate', 0.001)
+    
+    if opt_type == 'adamw':
+        # AdamW: Modern standard, uses weight_decay parameter
+        weight_decay = optimizer_config.get('weight_decay', optimizer_config.get('decay', 0.0005))
+        beta_1 = optimizer_config.get('beta_1', 0.9)
+        beta_2 = optimizer_config.get('beta_2', 0.999)
+        epsilon = optimizer_config.get('epsilon', 1e-7)
+        optimizer = AdamW(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            beta_1=beta_1,
+            beta_2=beta_2,
+            epsilon=epsilon
+        )
+        print(f"✓ Created AdamW optimizer: lr={learning_rate}, weight_decay={weight_decay}")
+        
+    elif opt_type == 'sgd':
+        # SGD: Traditional optimizer with momentum
+        momentum = optimizer_config.get('momentum', 0.937)
+        decay = optimizer_config.get('decay', 0.0005)
+        nesterov = optimizer_config.get('nesterov', False)
+        optimizer = SGD(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            decay=decay,
+            nesterov=nesterov
+        )
+        print(f"✓ Created SGD optimizer: lr={learning_rate}, momentum={momentum}, decay={decay}")
+        
+    else:  # Default to Adam
+        # Adam: Basic Adam optimizer (legacy support)
+        beta_1 = optimizer_config.get('beta_1', 0.9)
+        beta_2 = optimizer_config.get('beta_2', 0.999)
+        epsilon = optimizer_config.get('epsilon', 1e-7)
+        decay = optimizer_config.get('decay', 0.0)  # Note: Adam uses decay, not weight_decay
+        optimizer = Adam(
+            learning_rate=learning_rate,
+            beta_1=beta_1,
+            beta_2=beta_2,
+            epsilon=epsilon,
+            decay=decay
+        )
+        print(f"✓ Created Adam optimizer: lr={learning_rate}, decay={decay}")
+    
+    return optimizer
 
 
 def build_model_from_config(config: Dict[str, Any], for_training: bool = False, anchors: List = None) -> Model:
@@ -34,6 +100,11 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
         if for_training and 'training' in config:
             loss_option = config['training'].get('loss_option', 2)
         
+        # Get optimizer if for training
+        optimizer = None
+        if for_training:
+            optimizer = create_optimizer_from_config(config)
+        
         if architecture == 'multigriddet_darknet':
             if for_training:
                 # Use training model with loss function
@@ -42,6 +113,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     input_shape=input_shape,
                     num_classes=num_classes,
                     weights_path=None,  # We'll load weights separately
+                    optimizer=optimizer,
                     loss_option=loss_option
                 )
             else:
@@ -62,6 +134,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     input_shape=input_shape,
                     num_classes=num_classes,
                     weights_path=None,  # We'll load weights separately
+                    optimizer=optimizer,
                     loss_option=loss_option
                 )
             else:

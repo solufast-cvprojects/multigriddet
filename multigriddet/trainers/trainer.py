@@ -7,8 +7,9 @@ Trainer class for MultiGridDet models.
 import os
 import sys
 import tensorflow as tf
+import numpy as np
 from tensorflow.keras.callbacks import (
-    TensorBoard, ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+    TensorBoard, ModelCheckpoint, ReduceLROnPlateau, EarlyStopping, Callback
 )
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -17,6 +18,76 @@ from ..config import ConfigLoader, build_model_for_training
 from ..utils.anchors import load_anchors, load_classes
 from ..utils.tf_optimization import optimize_tf_gpu
 from ..data import MultiGridDataGenerator, load_annotation_lines
+
+
+class CosineAnnealingWithWarmup(Callback):
+    """
+    Cosine annealing learning rate schedule with warmup.
+    
+    Modern LR schedule used in YOLOv8/YOLOv9:
+    - Warmup: Linear increase from warmup_lr to initial_lr over warmup_epochs
+    - Cosine Annealing: Smooth decay from initial_lr to min_lr following cosine curve
+    """
+    
+    def __init__(self, initial_lr: float, min_lr: float = 1e-7, 
+                 warmup_epochs: int = 3, total_epochs: int = 100,
+                 warmup_lr_factor: float = 0.01, verbose: int = 1):
+        """
+        Initialize cosine annealing with warmup.
+        
+        Args:
+            initial_lr: Initial learning rate after warmup
+            min_lr: Minimum learning rate (end of cosine decay)
+            warmup_epochs: Number of epochs for warmup
+            total_epochs: Total number of training epochs
+            warmup_lr_factor: Factor to multiply initial_lr for warmup start (default: 0.01 = 1% of initial_lr)
+            verbose: Verbosity level
+        """
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.min_lr = min_lr
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.warmup_lr = initial_lr * warmup_lr_factor
+        self.verbose = verbose
+        self.epoch_count = 0
+        
+    def on_epoch_begin(self, epoch, logs=None):
+        """Update learning rate at the beginning of each epoch."""
+        self.epoch_count = epoch + 1  # epoch is 0-indexed
+        
+        if self.epoch_count <= self.warmup_epochs:
+            # Warmup phase: linear increase from warmup_lr to initial_lr
+            lr = self.warmup_lr + (self.initial_lr - self.warmup_lr) * (self.epoch_count / self.warmup_epochs)
+        else:
+            # Cosine annealing phase
+            # Calculate progress through cosine decay (0 to 1)
+            progress = (self.epoch_count - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            # Cosine decay: lr = min_lr + (initial_lr - min_lr) * (1 + cos(π * progress)) / 2
+            lr = self.min_lr + (self.initial_lr - self.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+        
+        # Set learning rate (compatible with both TF 2.x and Keras 3.x)
+        if hasattr(self.model.optimizer.learning_rate, 'assign'):
+            self.model.optimizer.learning_rate.assign(lr)
+        else:
+            tf.keras.backend.set_value(self.model.optimizer.learning_rate, lr)
+        
+        if self.verbose > 0:
+            print(f'\nEpoch {self.epoch_count}/{self.total_epochs} - Learning rate: {lr:.2e}')
+    
+    def on_train_begin(self, logs=None):
+        """Initialize learning rate at the start of training."""
+        # Set initial learning rate (compatible with both TF 2.x and Keras 3.x)
+        if hasattr(self.model.optimizer.learning_rate, 'assign'):
+            self.model.optimizer.learning_rate.assign(self.warmup_lr)
+        else:
+            tf.keras.backend.set_value(self.model.optimizer.learning_rate, self.warmup_lr)
+        if self.verbose > 0:
+            print(f'\nCosine Annealing with Warmup initialized:')
+            print(f'  Warmup epochs: {self.warmup_epochs}')
+            print(f'  Initial LR: {self.initial_lr:.2e}')
+            print(f'  Min LR: {self.min_lr:.2e}')
+            print(f'  Warmup start LR: {self.warmup_lr:.2e}')
 
 
 class MultiGridTrainer:
@@ -146,12 +217,31 @@ class MultiGridTrainer:
                 shuffle_buffer_size = data_loader_config.get('shuffle_buffer_size', 4096)
                 interleave_cycle_length = data_loader_config.get('interleave_cycle_length', None)
                 
+                # Check if we're in frozen backbone stage (transfer learning)
+                # In this stage, model compute is lighter, so reduce data pipeline overhead
+                training_config = self.config.get('training', {})
+                transfer_epochs = training_config.get('transfer_epochs', 0)
+                initial_epoch = training_config.get('initial_epoch', 0)
+                is_frozen_stage = transfer_epochs > 0 and initial_epoch < transfer_epochs
+                
+                if is_frozen_stage:
+                    # Optimize for frozen backbone: reduce overhead, focus on throughput
+                    # Interleaving adds overhead when model compute is light
+                    if interleave_cycle_length is None or interleave_cycle_length > 8:
+                        interleave_cycle_length = None  # Disable or reduce interleaving
+                    # Reduce parallel calls slightly to reduce contention
+                    if num_parallel_calls != tf.data.AUTOTUNE and num_parallel_calls > 16:
+                        num_parallel_calls = 16
+                    print("[INFO] Frozen backbone stage detected - optimizing data pipeline for lighter compute")
+                
                 print("[INFO] Building native tf.data.Dataset pipeline with GPU-accelerated preprocessing...")
                 print(f"   Prefetch buffer: {prefetch_batches} batches")
                 print(f"   Parallel calls: {num_parallel_calls if num_parallel_calls != tf.data.AUTOTUNE else 'AUTOTUNE'}")
                 print(f"   Shuffle buffer: {shuffle_buffer_size}")
                 if interleave_cycle_length:
                     print(f"   Interleave cycle length: {interleave_cycle_length}")
+                else:
+                    print(f"   Interleaving: disabled (optimized for current stage)")
                 
                 self.train_dataset = self.train_generator.build_tf_dataset(
                     prefetch_buffer_size=prefetch_batches,
@@ -254,7 +344,28 @@ class MultiGridTrainer:
         # Learning Rate Scheduler
         if 'lr_schedule' in self.config:
             lr_config = self.config['lr_schedule']
-            if lr_config.get('type') == 'reduce_on_plateau':
+            schedule_type = lr_config.get('type', 'reduce_on_plateau')
+            
+            if schedule_type == 'cosine_annealing':
+                # Modern cosine annealing with warmup (recommended)
+                training_config = self.config.get('training', {})
+                total_epochs = training_config.get('epochs', 100)
+                initial_lr = self.config.get('optimizer', {}).get('learning_rate', 
+                                                                  training_config.get('learning_rate', 0.001))
+                
+                cosine_lr = CosineAnnealingWithWarmup(
+                    initial_lr=initial_lr,
+                    min_lr=lr_config.get('min_lr', 1e-7),
+                    warmup_epochs=lr_config.get('warmup_epochs', 3),
+                    total_epochs=total_epochs,
+                    warmup_lr_factor=lr_config.get('warmup_lr_factor', 0.01),
+                    verbose=1
+                )
+                self.callbacks.append(cosine_lr)
+                print(f"   ✓ CosineAnnealingWithWarmup (warmup={lr_config.get('warmup_epochs', 3)} epochs)")
+                
+            elif schedule_type == 'reduce_on_plateau':
+                # Legacy reduce on plateau (reactive)
                 reduce_lr = ReduceLROnPlateau(
                     monitor='val_loss',
                     factor=lr_config.get('factor', 0.5),
@@ -263,7 +374,9 @@ class MultiGridTrainer:
                     verbose=1
                 )
                 self.callbacks.append(reduce_lr)
-                print(f"   ✓ ReduceLROnPlateau")
+                print(f"   ✓ ReduceLROnPlateau (legacy)")
+            else:
+                print(f"   ⚠ Unknown LR schedule type: {schedule_type}, skipping...")
         
         # Early Stopping
         if 'early_stopping' in callback_config:
