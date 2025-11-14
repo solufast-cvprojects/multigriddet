@@ -126,11 +126,13 @@ class MultiGridLoss:
         
         Loss Formula (Option 2):
         L_total = coord_scale * L_location + 
-                  object_scale * L_anchor + 
+                  object_scale * L_objectness +
+                  anchor_scale * L_anchor + 
                   class_scale * L_classification
         
         Where:
         - L_location = MSE(true_xy - pred_xy) + MSE(true_wh - pred_wh) [only on object cells]
+        - L_objectness = BCE(true_obj, sigmoid(pred_obj)) [on all cells]
         - L_anchor = BCE(true_anchors, pred_anchors) [on object cells and ignore regions]
         - L_classification = BCE(true_class, pred_class) [only on object cells, all classes]
         
@@ -151,6 +153,7 @@ class MultiGridLoss:
         batch_size_f = K.cast(batch_size, 'float32')
         
         total_loss_location = 0
+        total_loss_objectness = 0
         total_loss_classification = 0
         total_loss_anchor = 0
         
@@ -168,6 +171,7 @@ class MultiGridLoss:
             # Extract prediction components
             pred_xy = y_pred_layer[..., 0:2]  # [batch, grid_h, grid_w, 2]
             pred_wh = y_pred_layer[..., 2:4]  # [batch, grid_h, grid_w, 2]
+            pred_obj = y_pred_layer[..., 4:5]  # [batch, grid_h, grid_w, 1] - raw logits
             pred_anchors = y_pred_layer[..., 5:5+num_anchors]  # [batch, grid_h, grid_w, num_anchors]
             pred_class = y_pred_layer[..., 5+num_anchors:]  # [batch, grid_h, grid_w, num_classes]
             
@@ -207,26 +211,20 @@ class MultiGridLoss:
                 ignore_mask = tf.zeros_like(object_mask)
             
             # ========== LOCALIZATION LOSS ==========
-            # Normalize by number of positive cells instead of batch size
-            num_positive_cells = K.maximum(1.0, K.sum(object_mask))
-            
-            # Debug: Assert num_positive_cells is valid
-            tf.debugging.assert_positive(num_positive_cells, message=f"num_positive_cells must be > 0 at layer {layer_idx}")
-            tf.debugging.assert_all_finite(num_positive_cells, message=f"num_positive_cells must be finite at layer {layer_idx}")
-            
+            # Normalize by batch_size for consistent measurement across batches
             if self.loss_option == 1:
                 # Option 1: Simple MSE (YOLOv3 style)
                 loc_loss = self._compute_mse_loss(
                     true_xy, true_wh, pred_xy, pred_wh, object_mask
                 )
-                loc_loss = loc_loss / num_positive_cells
+                loc_loss = loc_loss / batch_size_f
                 
             elif self.loss_option == 2:
                 # Option 2: MSE + Anchor prediction loss
                 loc_loss = self._compute_mse_loss(
                     true_xy, true_wh, pred_xy, pred_wh, object_mask
                 )
-                loc_loss = loc_loss / num_positive_cells
+                loc_loss = loc_loss / batch_size_f
                 
                 # Anchor prediction loss (part of Option 2)
                 anchor_loc_loss = self._compute_anchor_loss(
@@ -252,33 +250,40 @@ class MultiGridLoss:
                     loc_loss = self._compute_mse_loss(
                         true_xy, true_wh, pred_xy, pred_wh, object_mask
                     )
-                loc_loss = loc_loss / num_positive_cells
+                loc_loss = loc_loss / batch_size_f
             
             total_loss_location += loc_loss
             
-            # ========== ANCHOR LOSS (Objectness) ==========
+            # ========== OBJECTNESS LOSS ==========
+            # Objectness loss: predicts if object exists in grid cell (sigmoid BCE)
+            obj_loss = self._compute_objectness_loss(
+                true_obj, pred_obj, object_mask, ignore_mask, batch_size_f
+            )
+            total_loss_objectness += obj_loss
+            
+            # ========== ANCHOR LOSS ==========
             # Only compute if NOT Option 2 (Option 2 computes it separately above)
             if self.loss_option != 2:
                 anchor_loss = self._compute_anchor_loss(
                     true_anchors, pred_anchors, object_mask, ignore_mask, batch_size_f
                 )
-                total_loss_anchor += self.object_scale * anchor_loss
+                total_loss_anchor += self.anchor_scale * anchor_loss
             
             # ========== CLASSIFICATION LOSS ==========
             # Use ALL classes, not just top-k!
-            # Normalize by number of positive cells (already computed above)
+            # Normalize by batch_size for consistent measurement
             if self.use_focal_loss and not self.use_softmax_loss:
                 class_loss = self._compute_focal_classification_loss(
-                    true_class, pred_class, object_mask, num_positive_cells
+                    true_class, pred_class, object_mask, batch_size_f
                 )
             elif self.use_softmax_loss:
                 class_loss = self._compute_softmax_classification_loss(
-                    true_class, pred_class, object_mask, num_positive_cells
+                    true_class, pred_class, object_mask, batch_size_f
                 )
             else:
                 # Standard BCE with label smoothing if enabled
                 class_loss = self._compute_bce_classification_loss(
-                    true_class, pred_class, object_mask, num_positive_cells
+                    true_class, pred_class, object_mask, batch_size_f
                 )
             
             total_loss_classification += class_loss
@@ -286,7 +291,8 @@ class MultiGridLoss:
         # ========== COMBINE ALL LOSSES ==========
         total_loss = (
             self.coord_scale * total_loss_location +
-            total_loss_anchor +
+            self.object_scale * total_loss_objectness +
+            self.anchor_scale * total_loss_anchor +
             self.class_scale * total_loss_classification
         )
         
@@ -616,44 +622,38 @@ class MultiGridLoss:
         # Apply weight mask: shape broadcasting [batch, grid_h, grid_w, 1] × [batch, grid_h, grid_w, num_anchors]
         anchor_loss = anchor_loss * combined_weight
         
-        # Normalize by number of active cells (positive + negative, excluding ignore)
-        num_active_cells = K.maximum(1.0, K.sum(combined_weight))
-        
-        # Debug: Assert normalization is valid
-        tf.debugging.assert_positive(num_active_cells, message="num_active_cells must be > 0")
-        tf.debugging.assert_all_finite(num_active_cells, message="num_active_cells must be finite")
-        
+        # Normalize by batch_size for consistent measurement
         anchor_loss_sum = K.sum(anchor_loss)
         tf.debugging.assert_all_finite(anchor_loss_sum, message="anchor_loss_sum must be finite")
         
-        return anchor_loss_sum / num_active_cells
+        return anchor_loss_sum / batch_size_f
     
     def _compute_focal_classification_loss(self, true_class: tf.Tensor, pred_class: tf.Tensor,
-                                         object_mask: tf.Tensor, num_positive_cells: tf.Tensor) -> tf.Tensor:
+                                         object_mask: tf.Tensor, batch_size_f: tf.Tensor) -> tf.Tensor:
         """Compute focal loss for classification (all classes)."""
         class_loss = self.focal_loss.compute_loss(true_class, pred_class)
         # Broadcasting: [batch, grid_h, grid_w, 1] * [batch, grid_h, grid_w, num_classes]
         class_loss = class_loss * object_mask
-        return K.sum(class_loss) / num_positive_cells
+        return K.sum(class_loss) / batch_size_f
     
     def _compute_softmax_classification_loss(self, true_class: tf.Tensor, pred_class: tf.Tensor,
-                                            object_mask: tf.Tensor, num_positive_cells: tf.Tensor) -> tf.Tensor:
+                                            object_mask: tf.Tensor, batch_size_f: tf.Tensor) -> tf.Tensor:
         """Compute softmax focal loss for classification (all classes)."""
         class_loss = self.softmax_focal_loss.compute_loss(true_class, pred_class)
         # Broadcasting: [batch, grid_h, grid_w, 1] * [batch, grid_h, grid_w, num_classes]
         class_loss = class_loss * object_mask
-        return K.sum(class_loss) / num_positive_cells
+        return K.sum(class_loss) / batch_size_f
     
     def _compute_bce_classification_loss(self, true_class: tf.Tensor, pred_class: tf.Tensor,
-                                        object_mask: tf.Tensor, num_positive_cells: tf.Tensor) -> tf.Tensor:
+                                        object_mask: tf.Tensor, batch_size_f: tf.Tensor) -> tf.Tensor:
         """
         Compute BCE loss for classification (all classes, not top-k!).
         
         Formula:
-        L_class = Σ object_mask * BCE(true_class, pred_class) / num_positive_cells
+        L_class = Σ object_mask * BCE(true_class, pred_class) / batch_size
         
         Applies to ALL classes, ensuring all classes receive gradients.
-        Normalized by number of positive cells instead of batch size for better gradient stability.
+        Normalized by batch_size for consistent measurement across batches.
         """
         # Apply label smoothing if enabled
         if self.label_smoothing > 0:
@@ -668,7 +668,49 @@ class MultiGridLoss:
         # Broadcasting: [batch, grid_h, grid_w, 1] * [batch, grid_h, grid_w, num_classes]
         class_loss = class_loss * object_mask
         
-        return K.sum(class_loss) / num_positive_cells
+        return K.sum(class_loss) / batch_size_f
+    
+    def _compute_objectness_loss(self, true_obj: tf.Tensor, pred_obj: tf.Tensor,
+                                object_mask: tf.Tensor, ignore_mask: Optional[tf.Tensor],
+                                batch_size_f: tf.Tensor) -> tf.Tensor:
+        """
+        Compute objectness loss using sigmoid BCE.
+        
+        Objectness predicts if an object exists in a grid cell.
+        
+        Formula:
+        L_objectness = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale] 
+                       * BCE(true_obj, sigmoid(pred_obj)) / batch_size
+        
+        This includes:
+        - Positive cells (object_mask > 0): weighted by object_scale
+        - Negative cells (object_mask == 0 and ignore_mask == 0): weighted by no_object_scale
+        - Ignore cells (ignore_mask > 0): excluded from loss
+        """
+        if ignore_mask is None:
+            ignore_mask = tf.zeros_like(object_mask)
+        
+        # Apply sigmoid to pred_obj (raw logits -> probabilities)
+        pred_obj_sigmoid = tf.nn.sigmoid(pred_obj)  # [batch, grid_h, grid_w, 1]
+        
+        # BCE loss on objectness predictions (from_logits=False since we already applied sigmoid)
+        objectness_loss = K.binary_crossentropy(true_obj, pred_obj_sigmoid, from_logits=False)
+        
+        # Weight mask: positive cells get object_scale, negative cells get no_object_scale
+        # Ignore cells (ignore_mask > 0) are excluded (weight = 0)
+        positive_weight = object_mask * self.object_scale  # [batch, grid_h, grid_w, 1]
+        negative_mask = (1.0 - object_mask) * (1.0 - ignore_mask)  # [batch, grid_h, grid_w, 1]
+        negative_weight = negative_mask * self.no_object_scale  # [batch, grid_h, grid_w, 1]
+        combined_weight = positive_weight + negative_weight  # [batch, grid_h, grid_w, 1]
+        
+        # Apply weight mask
+        objectness_loss = objectness_loss * combined_weight
+        
+        # Normalize by batch_size for consistent measurement
+        objectness_loss_sum = K.sum(objectness_loss)
+        tf.debugging.assert_all_finite(objectness_loss_sum, message="objectness_loss_sum must be finite")
+        
+        return objectness_loss_sum / batch_size_f
 
 
 def multigriddet_loss(args, anchors, num_classes, **kwargs):

@@ -34,6 +34,14 @@ training:
   label_smoothing: 0.1     # Professional standard: 0.1-0.2 for regularization
   elim_grid_sense: false
   
+  # Loss scale parameters
+  loss:
+    coord_scale: 1.0       # Scale for localization (coordinate) loss
+    object_scale: 5.0      # Scale for objectness loss (positive cells)
+    no_object_scale: 1.0   # Scale for objectness loss (negative cells)
+    class_scale: 1.0       # Scale for classification loss
+    anchor_scale: 1.0      # Scale for anchor prediction loss
+  
   # Data augmentation
   augmentation:
     enabled: true

@@ -96,10 +96,23 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
         num_classes = preset_config['num_classes']
         input_shape = tuple(preset_config['input_shape'])
         
-        # Get loss option if for training
+        # Get loss option and loss scales if for training
         loss_option = 2  # Default
+        loss_scales = {}  # Default empty dict (will use defaults in MultiGridLoss)
         if for_training and 'training' in config:
-            loss_option = config['training'].get('loss_option', 2)
+            training_config = config['training']
+            loss_option = training_config.get('loss_option', 2)
+            
+            # Extract loss scale parameters from config
+            loss_config = training_config.get('loss', {})
+            if loss_config:
+                loss_scales = {
+                    'coord_scale': loss_config.get('coord_scale', 1.0),
+                    'object_scale': loss_config.get('object_scale', 1.0),
+                    'no_object_scale': loss_config.get('no_object_scale', 1.0),
+                    'class_scale': loss_config.get('class_scale', 1.0),
+                    'anchor_scale': loss_config.get('anchor_scale', 1.0),
+                }
         
         # Get optimizer if for training
         optimizer = None
@@ -116,7 +129,8 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     weights_path=weights_path,
                     backbone_weights_path=backbone_weights_path,
                     optimizer=optimizer,
-                    loss_option=loss_option
+                    loss_option=loss_option,
+                    **loss_scales  # Pass loss scale parameters
                 )
             else:
                 # Use inference model
@@ -138,7 +152,8 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     weights_path=weights_path,
                     backbone_weights_path=backbone_weights_path,
                     optimizer=optimizer,
-                    loss_option=loss_option
+                    loss_option=loss_option,
+                    **loss_scales  # Pass loss scale parameters
                 )
             else:
                 # Use inference model

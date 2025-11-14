@@ -87,6 +87,11 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
                                     label_smoothing: float = 0.0,
                                     elim_grid_sense: bool = False,
                                     loss_option: int = 3,  # NEW: Add this parameter
+                                    coord_scale: float = 1.0,
+                                    object_scale: float = 1.0,
+                                    no_object_scale: float = 1.0,
+                                    class_scale: float = 1.0,
+                                    anchor_scale: float = 1.0,
                                     **kwargs) -> Tuple[Model, int]:
     """
     Build training model for multigriddet_darknet.
@@ -102,6 +107,11 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         label_smoothing: Label smoothing factor
         elim_grid_sense: Eliminate grid sense loss
         loss_option: Loss option (1=IoU, 2=GIOU, 3=CIoU)
+        coord_scale: Scale for localization (coordinate) loss
+        object_scale: Scale for objectness loss (positive cells)
+        no_object_scale: Scale for objectness loss (negative cells)
+        class_scale: Scale for classification loss
+        anchor_scale: Scale for anchor prediction loss
         **kwargs: Additional arguments
         
     Returns:
@@ -158,7 +168,12 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         input_shape=input_shape[:2], # Pass only H, W
         label_smoothing=label_smoothing,
         elim_grid_sense=elim_grid_sense,
-        loss_option=loss_option  # Pass the option
+        loss_option=loss_option,  # Pass the option
+        coord_scale=coord_scale,
+        object_scale=object_scale,
+        no_object_scale=no_object_scale,
+        class_scale=class_scale,
+        anchor_scale=anchor_scale
     )
     
     # Create loss layer using Lambda
