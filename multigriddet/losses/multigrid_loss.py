@@ -622,11 +622,16 @@ class MultiGridLoss:
         # Apply weight mask: shape broadcasting [batch, grid_h, grid_w, 1] × [batch, grid_h, grid_w, num_anchors]
         anchor_loss = anchor_loss * combined_weight
         
-        # Normalize by batch_size for consistent measurement
+        # Normalize by total number of grid cells (batch_size * grid_h * grid_w) for stability
+        # Anchor loss applies to all cells (positive and negative), so normalize by total cells
+        grid_shape = K.shape(anchor_loss)
+        total_grid_cells = K.cast(grid_shape[0] * grid_shape[1] * grid_shape[2], 'float32')
+        total_grid_cells = K.maximum(total_grid_cells, 1.0)  # Avoid division by zero
+        
         anchor_loss_sum = K.sum(anchor_loss)
         tf.debugging.assert_all_finite(anchor_loss_sum, message="anchor_loss_sum must be finite")
         
-        return anchor_loss_sum / batch_size_f
+        return anchor_loss_sum / total_grid_cells
     
     def _compute_focal_classification_loss(self, true_class: tf.Tensor, pred_class: tf.Tensor,
                                          object_mask: tf.Tensor, batch_size_f: tf.Tensor) -> tf.Tensor:
@@ -680,7 +685,9 @@ class MultiGridLoss:
         
         Formula:
         L_objectness = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale] 
-                       * BCE(true_obj, sigmoid(pred_obj)) / batch_size
+                       * BCE(true_obj, sigmoid(pred_obj)) / (batch_size * grid_h * grid_w)
+        
+        Normalized by total grid cells for stability (objectness applies to all cells, not just objects).
         
         This includes:
         - Positive cells (object_mask > 0): weighted by object_scale
@@ -706,11 +713,16 @@ class MultiGridLoss:
         # Apply weight mask
         objectness_loss = objectness_loss * combined_weight
         
-        # Normalize by batch_size for consistent measurement
+        # Normalize by total number of grid cells (batch_size * grid_h * grid_w) for stability
+        # This is more stable than batch_size alone since objectness applies to all cells
+        grid_shape = K.shape(objectness_loss)
+        total_grid_cells = K.cast(grid_shape[0] * grid_shape[1] * grid_shape[2], 'float32')
+        total_grid_cells = K.maximum(total_grid_cells, 1.0)  # Avoid division by zero
+        
         objectness_loss_sum = K.sum(objectness_loss)
         tf.debugging.assert_all_finite(objectness_loss_sum, message="objectness_loss_sum must be finite")
         
-        return objectness_loss_sum / batch_size_f
+        return objectness_loss_sum / total_grid_cells
 
 
 def multigriddet_loss(args, anchors, num_classes, **kwargs):
