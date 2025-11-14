@@ -7,6 +7,7 @@ Train object detection models with YAML configuration.
 Usage:
     python train.py --config configs/train_config.yaml
     python train.py --config configs/train_config.yaml --weights weights/model5.h5
+    python train.py --config configs/train_config.yaml --backbone-weights weights/darknet53.h5
     python train.py --config configs/train_config.yaml --resume
 """
 
@@ -38,7 +39,13 @@ def parse_args():
         '--weights', 
         type=str, 
         default=None,
-        help='Path to pretrained weights (overrides config)'
+        help='Path to pretrained full model weights (overrides config)'
+    )
+    parser.add_argument(
+        '--backbone-weights', 
+        type=str, 
+        default=None,
+        help='Path to pretrained backbone weights (e.g., darknet53.h5)'
     )
     parser.add_argument(
         '--resume', 
@@ -83,15 +90,18 @@ def main():
         return 1
     
     # Override with command-line args
+    if 'resume' not in config:
+        config['resume'] = {}
+    
     if args.weights:
-        if 'resume' not in config:
-            config['resume'] = {}
         config['resume']['weights_path'] = args.weights
-        print(f"   Using weights: {args.weights}")
+        print(f"   Using full model weights: {args.weights}")
+    
+    if args.backbone_weights:
+        config['resume']['backbone_weights_path'] = args.backbone_weights
+        print(f"   Using backbone weights: {args.backbone_weights}")
     
     if args.resume:
-        if 'resume' not in config:
-            config['resume'] = {}
         config['resume']['enabled'] = True
         print(f"   Resume mode enabled")
     

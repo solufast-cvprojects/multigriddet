@@ -20,14 +20,14 @@ data_loader:
   
 # Training parameters
 training:
-  batch_size: 8
+  batch_size: 4
   epochs: 100
   initial_epoch: 0
   learning_rate: 0.001
   
   # Two-stage training
   transfer_epochs: 50      # Freeze backbone first
-  freeze_level: 1          # 0=all, 1=backbone, 2=all but head
+  freeze_level: 2          # 0=all, 1=backbone, 2=all but head
   
   # Loss configuration
   loss_option: 2           # 1=IoL-MSE, 2=IoL-MSE+mask, 3=GIoU/DIoU
@@ -78,7 +78,8 @@ callbacks:
 # Resume training
 resume:
   enabled: false
-  weights_path: null
+  weights_path: null          # Path to pretrained full model weights (e.g., model5.h5)
+  backbone_weights_path: null  # Path to pretrained backbone weights (e.g., darknet53.h5)
   
 # Output
 output:

@@ -102,6 +102,7 @@ def build_multigriddet_resnet_train(anchors: List[np.ndarray],
                                     num_classes: int = 80,
                                     input_shape: Tuple[int, int, int] = (416, 416, 3),
                                     weights_path: Optional[str] = None,
+                                    backbone_weights_path: Optional[str] = None,
                                     freeze_level: int = 1,
                                     optimizer: Optional[tf.keras.optimizers.Optimizer] = None,
                                     label_smoothing: float = 0.0,
@@ -115,7 +116,8 @@ def build_multigriddet_resnet_train(anchors: List[np.ndarray],
         anchors: List of anchor arrays for each scale
         num_classes: Number of object classes
         input_shape: Input image shape
-        weights_path: Path to pretrained weights
+        weights_path: Path to pretrained full model weights
+        backbone_weights_path: Path to pretrained backbone weights (e.g., darknet53.h5)
         freeze_level: Freeze level (0=unfreeze all, 1=freeze backbone, 2=freeze all but head)
         optimizer: Optimizer for training
         label_smoothing: Label smoothing factor
@@ -130,25 +132,27 @@ def build_multigriddet_resnet_train(anchors: List[np.ndarray],
     
     print(f"num_anchors_per_head: {num_anchors_per_head}")
     
-    # Build base model
+    # Build base model with backbone weights (if provided)
+    # Backbone weights are loaded during model construction
     model, backbone_len = build_multigriddet_resnet(
         input_shape=input_shape,
         num_anchors_per_head=num_anchors_per_head,
         num_classes=num_classes,
-        weights_path=weights_path,
+        weights_path=backbone_weights_path,  # Pass backbone weights to load into backbone
         **kwargs
     )
     
     print(f'Create MultiGridDet ResNet model with {sum(num_anchors_per_head)} anchors and {num_classes} classes.')
     print(f'model layer number: {len(model.layers)}')
     
-    # Load additional weights if provided
+    # Load full model weights if provided (after backbone weights)
+    # This allows full model weights to override backbone weights if both are provided
     if weights_path and tf.io.gfile.exists(weights_path):
         try:
             model.load_weights(weights_path, by_name=True)
-            print(f'Load weights {weights_path}.')
+            print(f'Loaded full model weights from {weights_path}.')
         except Exception as e:
-            print(f'Warning: Could not load weights from {weights_path}: {e}')
+            print(f'Warning: Could not load full model weights from {weights_path}: {e}')
     
     # Apply freezing based on freeze_level
     if freeze_level in [1, 2]:

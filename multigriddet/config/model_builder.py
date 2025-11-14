@@ -82,7 +82,8 @@ def create_optimizer_from_config(config: Dict[str, Any]) -> tf.keras.optimizers.
     return optimizer
 
 
-def build_model_from_config(config: Dict[str, Any], for_training: bool = False, anchors: List = None) -> Model:
+def build_model_from_config(config: Dict[str, Any], for_training: bool = False, anchors: List = None, 
+                           weights_path: Optional[str] = None, backbone_weights_path: Optional[str] = None) -> Model:
     """Build model from YAML configuration."""
     
     model_config = config['model']
@@ -112,7 +113,8 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     anchors=anchors or [[10,13], [16,30], [33,23], [30,61], [62,45], [59,119], [116,90], [156,198], [373,326]],  # Default COCO anchors
                     input_shape=input_shape,
                     num_classes=num_classes,
-                    weights_path=None,  # We'll load weights separately
+                    weights_path=weights_path,
+                    backbone_weights_path=backbone_weights_path,
                     optimizer=optimizer,
                     loss_option=loss_option
                 )
@@ -122,7 +124,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     input_shape=input_shape,
                     num_classes=num_classes,
                     num_anchors_per_head=[3, 3, 3],
-                    weights_path=None
+                    weights_path=backbone_weights_path or weights_path
                 )
             # Handle both tuple (model, backbone_len) and single model return
             model = result[0] if isinstance(result, tuple) else result
@@ -133,7 +135,8 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     anchors=anchors or [[10,13], [16,30], [33,23], [30,61], [62,45], [59,119], [116,90], [156,198], [373,326]],  # Default COCO anchors
                     input_shape=input_shape,
                     num_classes=num_classes,
-                    weights_path=None,  # We'll load weights separately
+                    weights_path=weights_path,
+                    backbone_weights_path=backbone_weights_path,
                     optimizer=optimizer,
                     loss_option=loss_option
                 )
@@ -143,7 +146,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     input_shape=input_shape,
                     num_classes=num_classes,
                     num_anchors_per_head=[3, 3, 3],
-                    weights_path=None
+                    weights_path=backbone_weights_path or weights_path
                 )
             # Handle both tuple (model, backbone_len) and single model return
             model = result[0] if isinstance(result, tuple) else result
@@ -160,9 +163,17 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
     return model
 
 
-def build_model_for_training(config: Dict[str, Any], anchors: List = None) -> Model:
+def build_model_for_training(config: Dict[str, Any], anchors: List = None, 
+                            weights_path: Optional[str] = None, 
+                            backbone_weights_path: Optional[str] = None) -> Model:
     """Build model specifically for training with loss function."""
-    model = build_model_from_config(config, for_training=True, anchors=anchors)
+    model = build_model_from_config(
+        config, 
+        for_training=True, 
+        anchors=anchors,
+        weights_path=weights_path,
+        backbone_weights_path=backbone_weights_path
+    )
     
     # Model is already compiled by build_multigriddet_darknet_train
     # No need to compile again - just return the model as-is

@@ -282,16 +282,22 @@ class MultiGridTrainer:
         anchors_path = self.model_config['model']['preset']['anchors_path']
         anchors = load_anchors(anchors_path)
         
-        self.model = build_model_for_training(self.full_config, anchors=anchors)
-        
-        # Load weights if resume is enabled
+        # Get weights paths from resume config (for pretrained weights)
+        # These are loaded during model building, before freezing
         resume_config = self.config.get('resume', {})
-        if resume_config.get('enabled', False):
-            weights_path = resume_config.get('weights_path')
-            if weights_path and os.path.exists(weights_path):
-                print(f"   Loading weights from: {weights_path}")
-                self.model.load_weights(weights_path, by_name=True)
-                print("   ✓ Weights loaded successfully")
+        weights_path = resume_config.get('weights_path')
+        backbone_weights_path = resume_config.get('backbone_weights_path')
+        
+        # Build model with weights (weights are loaded during model construction)
+        self.model = build_model_for_training(
+            self.full_config, 
+            anchors=anchors,
+            weights_path=weights_path,
+            backbone_weights_path=backbone_weights_path
+        )
+        
+        # Note: Weights are now loaded during model building (before freezing)
+        # resume.enabled is only for actual resume (optimizer state, epoch number, etc.)
         
         # Model is already compiled by build_multigriddet_darknet_train
         # No need to compile again - just use the model as-is
