@@ -7,6 +7,7 @@ Builds models from YAML configuration.
 
 import os
 from typing import Dict, Any, List, Tuple, Optional
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input
@@ -15,6 +16,7 @@ from tensorflow.keras.optimizers import Adam, AdamW, SGD
 from ..models import build_multigriddet_darknet, build_multigriddet_resnet
 from ..models.multigriddet_darknet import build_multigriddet_darknet_train
 from ..models.multigriddet_resnet import build_multigriddet_resnet_train
+from ..utils.anchors import compute_class_weights
 
 
 def create_optimizer_from_config(config: Dict[str, Any]) -> tf.keras.optimizers.Optimizer:
@@ -113,6 +115,33 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     'class_scale': loss_config.get('class_scale', 1.0),
                     'anchor_scale': loss_config.get('anchor_scale', 1.0),
                 }
+            
+            # Compute class weights for handling class imbalance
+            class_weights_config = training_config.get('class_weights', None)
+            if class_weights_config is not None:
+                if isinstance(class_weights_config, str) and class_weights_config.lower() == 'auto':
+                    # Auto-compute from training data
+                    data_config = config.get('data', {})
+                    train_annotation = data_config.get('train_annotation')
+                    if train_annotation:
+                        class_weights_method = training_config.get('class_weights_method', 'balanced')
+                        class_weights = compute_class_weights(train_annotation, num_classes, method=class_weights_method)
+                        loss_scales['class_weights'] = class_weights
+                        print(f"[INFO] Computed class weights using '{class_weights_method}' method")
+                        print(f"   Class weights range: [{np.min(class_weights):.3f}, {np.max(class_weights):.3f}]")
+                        print(f"   Mean weight: {np.mean(class_weights):.3f}")
+                elif isinstance(class_weights_config, (list, np.ndarray)):
+                    # Manual class weights provided
+                    class_weights = np.array(class_weights_config, dtype=np.float32)
+                    if len(class_weights) != num_classes:
+                        raise ValueError(f"class_weights length ({len(class_weights)}) must match num_classes ({num_classes})")
+                    loss_scales['class_weights'] = class_weights
+                    print(f"[INFO] Using manual class weights")
+                else:
+                    print(f"[WARNING] Invalid class_weights config, using equal weights")
+            else:
+                # No class weights specified, use equal weights (default)
+                pass
         
         # Get optimizer if for training
         optimizer = None

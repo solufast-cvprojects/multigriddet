@@ -41,6 +41,14 @@ training:
     no_object_scale: 0.5   # Scale for objectness loss (negative cells)
     class_scale: 1.0       # Scale for classification loss
     anchor_scale: 1.0      # Scale for anchor prediction loss
+
+  # Class weights for handling class imbalance
+  # Options:
+  #   - 'auto': Automatically compute from training data (recommended)
+  #   - List of weights: [w0, w1, w2, ...] for each class
+  #   - null/omitted: Use equal weights (1.0 for all classes)
+  class_weights: auto              # 'auto' to compute from data, or list of weights
+  class_weights_method: balanced    # Method for auto-computation: 'balanced', 'inverse', or 'sqrt_inverse'
   
   # Data augmentation
   augmentation:

@@ -92,6 +92,7 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
                                     no_object_scale: float = 1.0,
                                     class_scale: float = 1.0,
                                     anchor_scale: float = 1.0,
+                                    class_weights: Optional[np.ndarray] = None,
                                     **kwargs) -> Tuple[Model, int]:
     """
     Build training model for multigriddet_darknet.
@@ -112,6 +113,7 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         no_object_scale: Scale for objectness loss (negative cells)
         class_scale: Scale for classification loss
         anchor_scale: Scale for anchor prediction loss
+        class_weights: Optional array of class weights for handling class imbalance [num_classes]
         **kwargs: Additional arguments
         
     Returns:
@@ -173,7 +175,8 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         object_scale=object_scale,
         no_object_scale=no_object_scale,
         class_scale=class_scale,
-        anchor_scale=anchor_scale
+        anchor_scale=anchor_scale,
+        class_weights=class_weights
     )
     
     # Create loss layer using Lambda

@@ -329,3 +329,77 @@ def load_classes(classes_path: str) -> List[str]:
             if line:
                 classes.append(line)
     return classes
+
+
+def compute_class_weights(annotation_file: str, num_classes: int, method: str = 'balanced') -> np.ndarray:
+    """
+    Compute class weights from annotation file to handle class imbalance.
+    
+    Args:
+        annotation_file: Path to annotation file (format: "image_path x1,y1,x2,y2,class ...")
+        num_classes: Number of classes
+        method: Weight computation method:
+            - 'balanced': weights = n_samples / (n_classes * np.bincount(y))
+            - 'inverse': weights = 1.0 / class_frequencies (normalized)
+            - 'sqrt_inverse': weights = 1.0 / sqrt(class_frequencies) (normalized)
+    
+    Returns:
+        Array of class weights [num_classes]
+    """
+    class_counts = np.zeros(num_classes, dtype=np.float32)
+    total_samples = 0
+    
+    # Count class occurrences
+    with open(annotation_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            
+            # Parse boxes: "x1,y1,x2,y2,class x1,y1,x2,y2,class ..."
+            for box_str in parts[1:]:
+                try:
+                    coords = box_str.split(',')
+                    if len(coords) >= 5:
+                        class_id = int(float(coords[4]))
+                        if 0 <= class_id < num_classes:
+                            class_counts[class_id] += 1.0
+                            total_samples += 1.0
+                except (ValueError, IndexError):
+                    continue
+    
+    # Compute weights based on method
+    if total_samples == 0:
+        # No samples found, return equal weights
+        return np.ones(num_classes, dtype=np.float32)
+    
+    class_frequencies = class_counts / (total_samples + 1e-8)  # Avoid division by zero
+    
+    if method == 'balanced':
+        # sklearn-style balanced weights: n_samples / (n_classes * class_counts)
+        # This gives higher weight to rare classes
+        weights = total_samples / (num_classes * (class_counts + 1e-8))
+        # Normalize so that average weight is 1.0
+        weights = weights / (np.mean(weights) + 1e-8)
+    elif method == 'inverse':
+        # Inverse frequency: rare classes get higher weight
+        weights = 1.0 / (class_frequencies + 1e-8)
+        # Normalize so that average weight is 1.0
+        weights = weights / (np.mean(weights) + 1e-8)
+    elif method == 'sqrt_inverse':
+        # Square root of inverse frequency (less aggressive than inverse)
+        weights = 1.0 / (np.sqrt(class_frequencies) + 1e-8)
+        # Normalize so that average weight is 1.0
+        weights = weights / (np.mean(weights) + 1e-8)
+    else:
+        # Default: equal weights
+        weights = np.ones(num_classes, dtype=np.float32)
+    
+    # Clip weights to reasonable range [0.1, 10.0] to avoid extreme values
+    weights = np.clip(weights, 0.1, 10.0)
+    
+    return weights.astype(np.float32)
