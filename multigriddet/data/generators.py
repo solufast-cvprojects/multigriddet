@@ -1804,6 +1804,67 @@ def tf_best_fit_and_layer_batch(boxes_wh: tf.Tensor, anchors: List[tf.Tensor]) -
 
 
 @tf.function
+def _invert_activation_numerically(desired_offset: tf.Tensor, max_iterations: int = 50, tolerance: float = 1e-8) -> tf.Tensor:
+    """
+    Numerically invert f(x) = tanh(0.15*x) + sigmoid(0.15*x) to find raw_xy.
+    
+    Uses Newton's method with safeguards for stability.
+    The activation function has range approximately [0, 2] for x in reasonable range.
+    For MultiGridDet, offsets can be in [-1, 2] range to span 3x3 neighborhood.
+    
+    Args:
+        desired_offset: Target value after activation (shape: any)
+        max_iterations: Maximum Newton iterations (increased for better convergence)
+        tolerance: Convergence tolerance (tighter for better precision)
+        
+    Returns:
+        raw_xy: Pre-activation value such that f(raw_xy) ≈ desired_offset
+    """
+    # Initial guess: approximate linear relationship for small values
+    # For small x: tanh(0.15*x) ≈ 0.15*x, sigmoid(0.15*x) ≈ 0.5 + 0.0375*x
+    # So f(x) ≈ 0.5 + 0.1875*x, thus x ≈ (f(x) - 0.5) / 0.1875
+    # But for larger offsets, we need a better initial guess
+    x = (desired_offset - 0.5) / 0.1875
+    
+    # For offsets near the edges of [-1, 2], we need larger x values
+    # Clamp initial guess but allow wider range for edge cases
+    x = tf.clip_by_value(x, -30.0, 30.0)
+    
+    # Use tf.while_loop for iteration
+    def body(i, x):
+        # Compute f(x) = tanh(0.15*x) + sigmoid(0.15*x)
+        fx = tf.tanh(0.15 * x) + tf.sigmoid(0.15 * x)
+        
+        # Compute f'(x) = 0.15 * (1 - tanh^2(0.15*x)) + 0.15 * sigmoid(0.15*x) * (1 - sigmoid(0.15*x))
+        tanh_val = tf.tanh(0.15 * x)
+        sigmoid_val = tf.sigmoid(0.15 * x)
+        fprime = 0.15 * (1.0 - tanh_val * tanh_val) + 0.15 * sigmoid_val * (1.0 - sigmoid_val)
+        
+        # Newton step: x_new = x - (f(x) - desired) / f'(x)
+        # Add small epsilon to avoid division by zero
+        fprime_safe = fprime + 1e-8
+        x_new = x - (fx - desired_offset) / fprime_safe
+        
+        # Allow wider range for edge cases (offsets near -1 or +2)
+        # The activation function is bounded, so very large x values are safe
+        x_new = tf.clip_by_value(x_new, -50.0, 50.0)
+        
+        return i + 1, x_new
+    
+    def condition(i, x):
+        # Continue if not converged and under max iterations
+        fx = tf.tanh(0.15 * x) + tf.sigmoid(0.15 * x)
+        diff = tf.abs(fx - desired_offset)
+        return tf.logical_and(i < max_iterations, tf.reduce_max(diff) >= tolerance)
+    
+    # Run Newton's method
+    i = tf.constant(0)
+    _, x_final = tf.while_loop(condition, body, [i, x], maximum_iterations=max_iterations)
+    
+    return x_final
+
+
+@tf.function
 def tf_preprocess_true_boxes(true_boxes: tf.Tensor, 
                              input_shape: Tuple[int, int],
                              anchors: List[tf.Tensor],
@@ -2066,8 +2127,11 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
     selected_scales_w = tf.gather(grid_scales_w, selected_layers)  # (batch, max_boxes)
     
     # Compute grid positions
-    cx = boxes_xy[:, :, 0] * selected_scales_h  # (batch, max_boxes)
-    cy = boxes_xy[:, :, 1] * selected_scales_w  # (batch, max_boxes)
+    # FIXED: Match decoding indexing where cell_grid[i,j] = [j, i] with i=row (y), j=col (x)
+    # boxes_xy is in PIXELS, selected_scales_w = grid_w / input_w, so:
+    # cx = boxes_xy * (grid_w / input_w) = (box_x / input_w) * grid_w (correct grid coordinate)
+    cx = boxes_xy[:, :, 0] * selected_scales_w  # (batch, max_boxes) - x * (grid_w / input_w)
+    cy = boxes_xy[:, :, 1] * selected_scales_h  # (batch, max_boxes) - y * (grid_h / input_h)
     
     # Debug: Assert grid position computation shapes
     tf.debugging.assert_shapes([
@@ -2077,19 +2141,21 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
         (cy, ['batch', 'max_boxes']),
     ], message="Grid position computation shapes")
     
-    i = tf.cast(cx, tf.int32)  # (batch, max_boxes)
-    j = tf.cast(cy, tf.int32)  # (batch, max_boxes)
+    # FIXED: grid_col is x-index (column), grid_row is y-index (row) to match decoding
+    grid_col = tf.cast(cx, tf.int32)  # (batch, max_boxes) - column (x) index
+    grid_row = tf.cast(cy, tf.int32)  # (batch, max_boxes) - row (y) index
     
-    tx = cx - tf.cast(i, tf.float32)  # (batch, max_boxes)
-    ty = cy - tf.cast(j, tf.float32)  # (batch, max_boxes)
+    # Compute fractional offsets within grid cell
+    tx = cx - tf.cast(grid_col, tf.float32)  # (batch, max_boxes) - fractional x offset [0, 1)
+    ty = cy - tf.cast(grid_row, tf.float32)  # (batch, max_boxes) - fractional y offset [0, 1)
     
-    # Debug: Assert i, j, tx, ty shapes
+    # Debug: Assert grid_row, grid_col, tx, ty shapes
     tf.debugging.assert_shapes([
-        (i, ['batch', 'max_boxes']),
-        (j, ['batch', 'max_boxes']),
+        (grid_row, ['batch', 'max_boxes']),
+        (grid_col, ['batch', 'max_boxes']),
         (tx, ['batch', 'max_boxes']),
         (ty, ['batch', 'max_boxes']),
-    ], message="i, j, tx, ty shapes")
+    ], message="grid_row, grid_col, tx, ty shapes")
     
     # ========================================================================
     # Step 3: Generate All Grid Cell Candidates (3x3 = 9 per box)
@@ -2105,11 +2171,11 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
     
     # Expand for broadcasting: (batch, max_boxes, 9)
     # Get dynamic batch and max_boxes dimensions
-    batch_size_dyn = tf.shape(i)[0]
-    max_boxes_dyn = tf.shape(i)[1]
+    batch_size_dyn = tf.shape(grid_row)[0]
+    max_boxes_dyn = tf.shape(grid_row)[1]
     
-    i_expanded = tf.expand_dims(i, axis=-1)  # (batch, max_boxes, 1)
-    j_expanded = tf.expand_dims(j, axis=-1)  # (batch, max_boxes, 1)
+    grid_row_expanded = tf.expand_dims(grid_row, axis=-1)  # (batch, max_boxes, 1)
+    grid_col_expanded = tf.expand_dims(grid_col, axis=-1)  # (batch, max_boxes, 1)
     
     # Create ki, kj with proper broadcasting shape: (1, 1, 9)
     ki_expanded = tf.reshape(ki_flat, [1, 1, 9])  # (1, 1, 9)
@@ -2117,14 +2183,16 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
     
     # Debug: Assert expanded shapes before addition
     tf.debugging.assert_shapes([
-        (i_expanded, ['batch', 'max_boxes', 1]),
-        (j_expanded, ['batch', 'max_boxes', 1]),
+        (grid_row_expanded, ['batch', 'max_boxes', 1]),
+        (grid_col_expanded, ['batch', 'max_boxes', 1]),
         (ki_expanded, [1, 1, 9]),
         (kj_expanded, [1, 1, 9]),
-    ], message="Expanded i, j, ki, kj shapes before addition")
+    ], message="Expanded grid_row, grid_col, ki, kj shapes before addition")
     
-    kii = i_expanded + ki_expanded  # (batch, max_boxes, 9)
-    kjj = j_expanded + kj_expanded  # (batch, max_boxes, 9)
+    # FIXED: kii is row index (y), kjj is col index (x) to match decoding
+    # ki offsets are row offsets, kj offsets are col offsets
+    kii = grid_row_expanded + ki_expanded  # (batch, max_boxes, 9) - row indices
+    kjj = grid_col_expanded + kj_expanded  # (batch, max_boxes, 9) - col indices
     
     # Debug: Assert kii, kjj shapes after addition
     tf.debugging.assert_shapes([
@@ -2178,13 +2246,14 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
         (kjj, ['batch', 'max_boxes', 9]),
     ], message="CRITICAL: Shapes before bounds checking - kii/kjj vs grid_h_expanded/grid_w_expanded")
     
-    # Bounds checking - TensorFlow will automatically broadcast the shapes
+    # FIXED: Bounds checking - kii is row index (height), kjj is col index (width)
     # kii/kjj: (batch, max_boxes, 9), grid_h_expanded/grid_w_expanded: (batch, max_boxes, 1)
     # Debug: Check shapes right before logical_and operations
     kii_shape = tf.shape(kii)
     grid_h_shape = tf.shape(grid_h_expanded)
     tf.print("DEBUG: kii shape =", kii_shape, "grid_h_expanded shape =", grid_h_shape, output_stream=tf.compat.v1.logging.info)
     
+    # kii is row index, so check against grid_h
     in_bounds_h = tf.logical_and(kii >= 0, kii < grid_h_expanded)  # (batch, max_boxes, 9)
     
     # Debug: Assert after first logical_and
@@ -2192,6 +2261,7 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
         (in_bounds_h, ['batch', 'max_boxes', 9]),
     ], message="in_bounds_h shape after first logical_and")
     
+    # kjj is col index, so check against grid_w
     in_bounds_w = tf.logical_and(kjj >= 0, kjj < grid_w_expanded)  # (batch, max_boxes, 9)
     
     # Debug: Assert after second logical_and
@@ -2341,8 +2411,8 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
             kjj_gathered = tf.gather_nd(kjj, gather_indices)  # (num_valid,)
             
             # Check occupancy: read current state of cells before updating
-            # Read occupancy: y_true[layer][batch, kjj, kii, 4]
-            occupancy_read_indices = tf.stack([batch_idx, kjj_gathered, kii_gathered], axis=1)  # (num_valid, 3)
+            # FIXED: y_true[layer][batch, grid_row, grid_col, 4] where kii=row, kjj=col
+            occupancy_read_indices = tf.stack([batch_idx, kii_gathered, kjj_gathered], axis=1)  # (num_valid, 3)
             cell_objectness = tf.gather_nd(y_true[layer_idx][:, :, :, 4], occupancy_read_indices)  # (num_valid,)
             is_occupied = cell_objectness > 0.5  # (num_valid,)
             
@@ -2401,25 +2471,62 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
                 ki_final = tf.gather(ki_flat, candidate_idx_final)  # (num_final_valid,)
                 kj_final = tf.gather(kj_flat, candidate_idx_final)  # (num_final_valid,)
                 
-                # Get anchors
-                anchor_w = tf.gather(anchors[layer_idx][:, 0], anchor_idx_final)  # (num_final_valid,)
-                anchor_h = tf.gather(anchors[layer_idx][:, 1], anchor_idx_final)  # (num_final_valid,)
+                # Get anchors (in pixels)
+                anchor_w = tf.gather(anchors[layer_idx][:, 0], anchor_idx_final)  # (num_final_valid,) - pixels
+                anchor_h = tf.gather(anchors[layer_idx][:, 1], anchor_idx_final)  # (num_final_valid,) - pixels
                 
-                # Calculate box to anchor ratios
-                box_w = box_wh_final[:, 0]  # (num_final_valid,)
-                box_h = box_wh_final[:, 1]  # (num_final_valid,)
-                box_wtoanchor_w = tf.maximum(box_w / anchor_w, 1e-3)
-                box_htoanchor_h = tf.maximum(box_h / anchor_h, 1e-3)
+                # FIXED: Width/height encoding - ensure consistent units (pixels)
+                # Decoding: box_wh = anchors_per_grid * exp(raw_wh); box_wh /= input_shape
+                # So: raw_wh = log((box_wh_normalized * input_shape) / anchors_per_grid)
+                # But anchors are in pixels, and box_wh_final is in PIXELS (from true_boxes)
+                # So we need: raw_wh = log((box_wh_pixels) / anchors_per_grid_pixels)
+                box_w_pixels = box_wh_final[:, 0]  # (num_final_valid,) - in PIXELS
+                box_h_pixels = box_wh_final[:, 1]  # (num_final_valid,) - in PIXELS
+                
+                # Compute raw_wh targets: log(box_wh_pixels / anchor_pixels)
+                box_wtoanchor_w = tf.maximum(box_w_pixels / anchor_w, 1e-3)
+                box_htoanchor_h = tf.maximum(box_h_pixels / anchor_h, 1e-3)
                 tw = tf.math.log(box_wtoanchor_w)  # (num_final_valid,)
                 th = tf.math.log(box_htoanchor_h)  # (num_final_valid,)
                 
-                # Create update vectors
-                ki_float_final = tf.cast(ki_final, tf.float32)  # (num_final_valid,)
-                kj_float_final = tf.cast(kj_final, tf.float32)  # (num_final_valid,)
+                # FIXED: XY encoding - compute raw_xy targets using numerical inversion
+                # Decoding: box_xy_normalized = (tanh(0.15*raw_xy) + sigmoid(0.15*raw_xy) + cell_grid) / grid_size
+                # So: desired_offset = (box_xy_normalized * grid_size) - cell_grid
+                # Then: raw_xy = invert_activation(desired_offset)
                 
-                # Build update vectors: [-ki+tx, -kj+ty, tw, th, 1.0, anchor_mask, class_one_hot]
-                # Note: Original code does y_true[...]*=0 first, so we zero out the cell
-                update_xy = tf.stack([-ki_float_final + tx_final, -kj_float_final + ty_final], axis=1)  # (num_final_valid, 2)
+                # Get grid size for this layer
+                grid_h_layer = tf.cast(grid_shapes[layer_idx][0], tf.float32)
+                grid_w_layer = tf.cast(grid_shapes[layer_idx][1], tf.float32)
+                
+                # Get box center - boxes_xy is in PIXELS, need to normalize
+                box_gather_indices_xy = tf.stack([batch_idx_final, box_idx_final], axis=1)  # (num_final_valid, 2)
+                box_xy_pixels = tf.gather_nd(boxes_xy, box_gather_indices_xy)  # (num_final_valid, 2) - [x, y] in PIXELS
+                # Normalize to [0,1]
+                box_xy_normalized = box_xy_pixels / tf.stack([tf.cast(input_w, tf.float32), tf.cast(input_h, tf.float32)], axis=0)  # (num_final_valid, 2)
+                
+                # Compute cell_grid values for each candidate cell
+                # cell_grid[i, j] = [j, i] where i=row, j=col
+                kii_float = tf.cast(kii_final, tf.float32)  # (num_final_valid,) - row indices
+                kjj_float = tf.cast(kjj_final, tf.float32)  # (num_final_valid,) - col indices
+                cell_grid_x = kjj_float  # (num_final_valid,) - col (x)
+                cell_grid_y = kii_float  # (num_final_valid,) - row (y)
+                cell_grid = tf.stack([cell_grid_x, cell_grid_y], axis=1)  # (num_final_valid, 2)
+                
+                # Compute desired offset: (box_xy_normalized * grid_size) - cell_grid
+                grid_size_vec = tf.stack([grid_w_layer, grid_h_layer], axis=0)  # (2,)
+                box_xy_grid_coords = box_xy_normalized * grid_size_vec  # (num_final_valid, 2)
+                desired_offset = box_xy_grid_coords - cell_grid  # (num_final_valid, 2)
+                
+                # Invert activation to get raw_xy targets
+                desired_offset_x = desired_offset[:, 0]  # (num_final_valid,)
+                desired_offset_y = desired_offset[:, 1]  # (num_final_valid,)
+                raw_xy_x = _invert_activation_numerically(desired_offset_x)  # (num_final_valid,)
+                raw_xy_y = _invert_activation_numerically(desired_offset_y)  # (num_final_valid,)
+                raw_xy = tf.stack([raw_xy_x, raw_xy_y], axis=1)  # (num_final_valid, 2)
+                
+                # Build update vectors: [raw_xy_x, raw_xy_y, tw, th, 1.0, anchor_mask, class_one_hot]
+                # Store pre-activation raw_xy values (model will apply activation during forward pass)
+                update_xy = raw_xy  # (num_final_valid, 2)
                 update_twth = tf.stack([tw, th], axis=1)  # (num_final_valid, 2)
                 update_obj = tf.ones([num_final_valid, 1], dtype=tf.float32)  # (num_final_valid, 1)
                 
@@ -2438,11 +2545,12 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
                     class_one_hot  # (num_final_valid, num_classes)
                 ], axis=1)  # (num_final_valid, feature_dim)
                 
-                # Create scatter indices: [batch, kjj, kii] for each update
+                # FIXED: Create scatter indices: [batch, grid_row, grid_col] to match y_true[batch, row, col, ...]
+                # kii is row index, kjj is col index
                 scatter_indices = tf.stack([
                     batch_idx_final,  # (num_final_valid,)
-                    kjj_final,  # (num_final_valid,)
-                    kii_final  # (num_final_valid,)
+                    kii_final,  # (num_final_valid,) - row index
+                    kjj_final  # (num_final_valid,) - col index
                 ], axis=1)  # (num_final_valid, 3)
                 
                 # Apply scatter update (this zeros out the cell first, then sets new values)

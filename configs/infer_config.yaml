@@ -10,7 +10,7 @@ input:
 
 # Detection parameters
 detection:
-  confidence_threshold: 0.1
+  confidence_threshold: 0.5
   nms_threshold: 0.45        # IoU threshold for NMS (lower = more aggressive suppression)
   nms_method: 'diou'         # NMS method: 'standard', 'diou', 'soft', 'cluster'
                              # - 'standard': Classic IoU-based NMS (fastest)
