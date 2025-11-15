@@ -160,7 +160,10 @@ class MultiGridLoss:
         """
         batch_size_f = K.cast(batch_size, 'float32')
         grid_h, grid_w = grid_shape
-        total_grid_cells = K.cast(batch_size_f * grid_h * grid_w, 'float32')
+        # Cast grid dimensions to float32 before multiplication to avoid type mismatch
+        grid_h_f = K.cast(grid_h, 'float32')
+        grid_w_f = K.cast(grid_w, 'float32')
+        total_grid_cells = batch_size_f * grid_h_f * grid_w_f
         
         norm_factor = 1.0
         for norm_type in self.loss_normalization:
