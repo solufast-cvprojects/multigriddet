@@ -26,7 +26,7 @@ training:
   learning_rate: 0.001
   
   # Two-stage training
-  transfer_epochs: 50      # Freeze backbone first
+  transfer_epochs: 0      # Freeze backbone first
   freeze_level: 2          # 0=all, 1=backbone, 2=all but head
   
   # Loss configuration
@@ -102,7 +102,6 @@ output:
   log_dir: logs/training
   model_dir: trained_models
   save_frequency: 1  # Save every N epochs
-
 
 
 

@@ -67,9 +67,14 @@ class CosineAnnealingWithWarmup(Callback):
             lr = self.min_lr + (self.initial_lr - self.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
         
         # Set learning rate (compatible with both TF 2.x and Keras 3.x)
+        # Use assign() method which works in both eager and graph mode without numpy conversion
         if hasattr(self.model.optimizer.learning_rate, 'assign'):
             self.model.optimizer.learning_rate.assign(lr)
+        elif isinstance(self.model.optimizer.learning_rate, (int, float)):
+            # If it's a simple float, we can set it directly
+            self.model.optimizer.learning_rate = lr
         else:
+            # Fallback: use set_value (should work in graph mode)
             tf.keras.backend.set_value(self.model.optimizer.learning_rate, lr)
         
         if self.verbose > 0:
@@ -78,9 +83,14 @@ class CosineAnnealingWithWarmup(Callback):
     def on_train_begin(self, logs=None):
         """Initialize learning rate at the start of training."""
         # Set initial learning rate (compatible with both TF 2.x and Keras 3.x)
+        # Use assign() method which works in both eager and graph mode without numpy conversion
         if hasattr(self.model.optimizer.learning_rate, 'assign'):
             self.model.optimizer.learning_rate.assign(self.warmup_lr)
+        elif isinstance(self.model.optimizer.learning_rate, (int, float)):
+            # If it's a simple float, we can set it directly
+            self.model.optimizer.learning_rate = self.warmup_lr
         else:
+            # Fallback: use set_value (should work in graph mode)
             tf.keras.backend.set_value(self.model.optimizer.learning_rate, self.warmup_lr)
         if self.verbose > 0:
             print(f'\nCosine Annealing with Warmup initialized:')
@@ -461,10 +471,45 @@ class MultiGridTrainer:
             
             # Recompile model to refresh trainable variables after unfreezing
             # Get optimizer and loss from current model
-            optimizer = self.model.optimizer
+            old_optimizer = self.model.optimizer
             loss = self.model.loss
+            
+            # Extract learning rate as Python float to avoid tensor-to-numpy conversion issues
+            # This prevents the "numpy() is only available when eager execution is enabled" error
+            # We avoid calling .numpy() on tensors by using config values instead
+            training_config = self.config.get('training', {})
+            optimizer_config = self.config.get('optimizer', {})
+            current_lr = optimizer_config.get('learning_rate', 
+                                              training_config.get('learning_rate', 0.001))
+            
+            # Try to get the current learning rate if it's a simple float (not a tensor)
+            # This avoids tensor-to-numpy conversion that requires eager execution
+            try:
+                if isinstance(old_optimizer.learning_rate, (int, float)):
+                    current_lr = float(old_optimizer.learning_rate)
+                elif hasattr(old_optimizer.learning_rate, '__call__'):
+                    # It's a schedule - use config value (callback will adjust it anyway)
+                    pass
+                # If it's a tensor, we skip extraction and use config value
+                # The callback will set the correct LR in the next epoch
+            except (AttributeError, TypeError):
+                # Fallback: use config value
+                pass
+            
+            # Create a new optimizer instance with the learning rate from config
+            # This ensures we have a clean optimizer without tensor dependencies
+            from ..config.model_builder import create_optimizer_from_config
+            optimizer = create_optimizer_from_config(self.config)
+            # Set learning rate to the extracted/config value
+            if hasattr(optimizer.learning_rate, 'assign'):
+                optimizer.learning_rate.assign(current_lr)
+            elif not hasattr(optimizer.learning_rate, '__call__'):
+                # Only set if it's not a schedule
+                optimizer.learning_rate = current_lr
+            
+            # Recompile with the new optimizer
             self.model.compile(optimizer=optimizer, loss=loss)
-            print(f"   Model recompiled to refresh trainable variables")
+            print(f"   Model recompiled to refresh trainable variables (LR: {current_lr:.2e})")
             
             initial_epoch = transfer_epochs
         
