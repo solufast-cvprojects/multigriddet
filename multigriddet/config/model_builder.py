@@ -148,6 +148,11 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
         if for_training:
             optimizer = create_optimizer_from_config(config)
         
+        # Get freeze_level from training config if for training
+        freeze_level = 1  # Default
+        if for_training and 'training' in config:
+            freeze_level = config['training'].get('freeze_level', 1)
+        
         if architecture == 'multigriddet_darknet':
             if for_training:
                 # Use training model with loss function
@@ -157,6 +162,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     num_classes=num_classes,
                     weights_path=weights_path,
                     backbone_weights_path=backbone_weights_path,
+                    freeze_level=freeze_level,
                     optimizer=optimizer,
                     loss_option=loss_option,
                     **loss_scales  # Pass loss scale parameters
@@ -180,6 +186,7 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     num_classes=num_classes,
                     weights_path=weights_path,
                     backbone_weights_path=backbone_weights_path,
+                    freeze_level=freeze_level,
                     optimizer=optimizer,
                     loss_option=loss_option,
                     **loss_scales  # Pass loss scale parameters

@@ -12,6 +12,7 @@ from typing import Tuple, List, Optional, Dict, Any
 import numpy as np
 import os
 import sys
+import h5py
 
 # Import from the new structure
 from .backbones.darknet import darknet53_body
@@ -19,6 +20,337 @@ from .heads.multigrid_head import multigriddet_predictions
 
 # Import MultiGridLoss for training
 from ..losses.multigrid_loss import MultiGridLoss
+
+
+def load_weights_with_debug(model: Model, weights_path: str, by_name: bool = True) -> Dict[str, Any]:
+    """
+    Load weights with detailed debugging information.
+    
+    This function wraps model.load_weights() and provides detailed statistics
+    about which layers were loaded successfully and which failed.
+    
+    Args:
+        model: Keras model to load weights into
+        weights_path: Path to weights file (HDF5 format)
+        by_name: Whether to load weights by layer name (default: True)
+        
+    Returns:
+        Dictionary with loading statistics:
+        - total_model_layers: Total number of layers in model
+        - total_weight_layers: Total number of layers in weight file
+        - loaded_count: Number of layers successfully loaded
+        - failed_count: Number of layers that failed to load
+        - loaded_layers: List of successfully loaded layer names
+        - failed_layers: List of failed layer names with reasons
+    """
+    stats = {
+        'total_model_layers': 0,
+        'total_weight_layers': 0,
+        'loaded_count': 0,
+        'failed_count': 0,
+        'loaded_layers': [],
+        'failed_layers': [],
+        'name_mismatches': [],
+        'shape_mismatches': [],
+        'missing_in_weights': [],
+        'missing_in_model': []
+    }
+    
+    print("\n" + "=" * 80)
+    print(f"[WEIGHT LOADING DEBUG] Loading weights from: {weights_path}")
+    print("=" * 80)
+    
+    # Get model layer information
+    model_layers = {}
+    for layer in model.layers:
+        if hasattr(layer, 'weights') and len(layer.weights) > 0:
+            layer_weights = {}
+            for weight in layer.weights:
+                weight_name = weight.name.replace(layer.name + '/', '').split(':')[0]
+                # Handle dtype - it might be a string or a dtype object
+                dtype_str = weight.dtype.name if hasattr(weight.dtype, 'name') else str(weight.dtype)
+                layer_weights[weight_name] = {
+                    'shape': tuple(weight.shape.as_list()),
+                    'dtype': dtype_str
+                }
+            if layer_weights:
+                model_layers[layer.name] = layer_weights
+    
+    stats['total_model_layers'] = len(model_layers)
+    print(f"  Model has {stats['total_model_layers']} layers with weights")
+    
+    # Get weight file layer information
+    weight_file_layers = {}
+    try:
+        with h5py.File(weights_path, 'r') as f:
+            # Try standard Keras format first: model_weights/layer_name/weight_name
+            if 'model_weights' in f:
+                for layer_name in f['model_weights'].keys():
+                    layer_group = f['model_weights'][layer_name]
+                    if isinstance(layer_group, h5py.Group):
+                        weight_shapes = {}
+                        # Handle both direct weights and nested structure
+                        # Structure can be: layer_name/weight_name OR layer_name/layer_name/weight_name
+                        for subkey in layer_group.keys():
+                            subitem = layer_group[subkey]
+                            if isinstance(subitem, h5py.Dataset):
+                                # Direct weight: layer_name/weight_name
+                                weight_shapes[subkey] = subitem.shape
+                            elif isinstance(subitem, h5py.Group):
+                                # Nested structure: layer_name/layer_name/weight_name
+                                for weight_name in subitem.keys():
+                                    if isinstance(subitem[weight_name], h5py.Dataset):
+                                        # Store with the nested path for clarity
+                                        weight_shapes[weight_name] = subitem[weight_name].shape
+                        if weight_shapes:
+                            weight_file_layers[layer_name] = weight_shapes
+            else:
+                # Try alternative format: direct layer groups
+                def get_layer_names(name, obj):
+                    if isinstance(obj, h5py.Group):
+                        # Check if this group contains weight arrays
+                        has_weights = False
+                        weight_shapes = {}
+                        for key in obj.keys():
+                            if isinstance(obj[key], h5py.Dataset):
+                                has_weights = True
+                                weight_shapes[key] = obj[key].shape
+                        if has_weights:
+                            # Extract layer name (remove path prefixes)
+                            parts = name.split('/')
+                            layer_name = parts[-1]
+                            # Skip root groups and optimizer weights
+                            if layer_name and layer_name not in ['model_weights', 'optimizer_weights', '']:
+                                weight_file_layers[layer_name] = weight_shapes
+                f.visititems(get_layer_names)
+    except Exception as e:
+        print(f"  [WARNING] Could not inspect weight file structure: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    stats['total_weight_layers'] = len(weight_file_layers)
+    print(f"  Weight file has {stats['total_weight_layers']} layers with weights")
+    
+    # Compare layer names
+    model_layer_names = set(model_layers.keys())
+    weight_layer_names = set(weight_file_layers.keys())
+    
+    common_layers = model_layer_names & weight_layer_names
+    only_in_model = model_layer_names - weight_layer_names
+    only_in_weights = weight_layer_names - model_layer_names
+    
+    print(f"  Common layers: {len(common_layers)}")
+    print(f"  Layers only in model: {len(only_in_model)}")
+    print(f"  Layers only in weight file: {len(only_in_weights)}")
+    
+    stats['missing_in_weights'] = list(only_in_model)
+    stats['missing_in_model'] = list(only_in_weights)
+    
+    # Try to load weights
+    try:
+        # Store a sample of initial weights for verification
+        sample_weights_before = {}
+        sample_layers = list(model_layers.keys())[:5]  # Sample first 5 layers
+        for layer_name in sample_layers:
+            layer = None
+            for l in model.layers:
+                if l.name == layer_name:
+                    layer = l
+                    break
+            if layer and len(layer.weights) > 0:
+                sample_weights_before[layer_name] = layer.weights[0].numpy().copy()
+        
+        model.load_weights(weights_path, by_name=by_name)
+        print(f"  [SUCCESS] Weight loading completed without exceptions")
+        
+        # Verify weights actually changed
+        weights_changed = False
+        for layer_name in sample_layers:
+            layer = None
+            for l in model.layers:
+                if l.name == layer_name:
+                    layer = l
+                    break
+            if layer and len(layer.weights) > 0 and layer_name in sample_weights_before:
+                weights_after = layer.weights[0].numpy()
+                weights_before = sample_weights_before[layer_name]
+                if not np.array_equal(weights_before, weights_after):
+                    weights_changed = True
+                    break
+        
+        if not weights_changed and len(sample_weights_before) > 0:
+            print(f"  [WARNING] Sample weights did not change after loading - weights may not have been applied!")
+        elif weights_changed:
+            print(f"  [VERIFIED] Sample weights changed after loading - weights were successfully applied")
+        
+        # Check which layers actually got loaded by comparing common layers
+        # Note: This is approximate since we can't easily check if weights changed
+        for layer_name in common_layers:
+            # Check if weight shapes match
+            model_weight_names = set(model_layers[layer_name].keys())
+            weight_file_weight_names = set(weight_file_layers[layer_name].keys())
+            
+            shape_matches = True
+            for weight_name in model_weight_names & weight_file_weight_names:
+                model_shape = model_layers[layer_name][weight_name]['shape']
+                weight_shape = weight_file_layers[layer_name][weight_name]
+                if model_shape != tuple(weight_shape):
+                    shape_matches = False
+                    stats['shape_mismatches'].append({
+                        'layer': layer_name,
+                        'weight': weight_name,
+                        'model_shape': model_shape,
+                        'weight_shape': tuple(weight_shape)
+                    })
+                    break
+            
+            if shape_matches:
+                stats['loaded_layers'].append(layer_name)
+                stats['loaded_count'] += 1
+            else:
+                stats['failed_layers'].append({
+                    'layer': layer_name,
+                    'reason': 'shape_mismatch'
+                })
+                stats['failed_count'] += 1
+        
+        # Layers only in model (not in weights) - these won't be loaded
+        for layer_name in only_in_model:
+            stats['failed_layers'].append({
+                'layer': layer_name,
+                'reason': 'missing_in_weight_file'
+            })
+            stats['failed_count'] += 1
+        
+        # Layers only in weights (not in model) - these will be skipped
+        for layer_name in only_in_weights:
+            stats['name_mismatches'].append(layer_name)
+        
+    except Exception as e:
+        print(f"  [ERROR] Exception during weight loading: {e}")
+        stats['failed_count'] = stats['total_model_layers']
+        import traceback
+        traceback.print_exc()
+    
+    # Print summary
+    print("\n  [SUMMARY]")
+    print(f"    Successfully loaded: {stats['loaded_count']} layers")
+    print(f"    Failed/Skipped: {stats['failed_count']} layers")
+    
+    if stats['shape_mismatches']:
+        print(f"    Shape mismatches: {len(stats['shape_mismatches'])}")
+        for mismatch in stats['shape_mismatches'][:10]:  # Show first 10
+            print(f"      - {mismatch['layer']}/{mismatch['weight']}: "
+                  f"model={mismatch['model_shape']}, weights={mismatch['weight_shape']}")
+        if len(stats['shape_mismatches']) > 10:
+            print(f"      ... and {len(stats['shape_mismatches']) - 10} more")
+    
+    if stats['missing_in_weights']:
+        print(f"    Missing in weight file: {len(stats['missing_in_weights'])} layers")
+        for layer_name in stats['missing_in_weights'][:10]:  # Show first 10
+            print(f"      - {layer_name}")
+        if len(stats['missing_in_weights']) > 10:
+            print(f"      ... and {len(stats['missing_in_weights']) - 10} more")
+    
+    if stats['missing_in_model']:
+        print(f"    Missing in model (skipped): {len(stats['missing_in_model'])} layers")
+        for layer_name in stats['missing_in_model'][:10]:  # Show first 10
+            print(f"      - {layer_name}")
+        if len(stats['missing_in_model']) > 10:
+            print(f"      ... and {len(stats['missing_in_model']) - 10} more")
+    
+    # Debug check 1: Which head layers are loaded?
+    print("\n  [DEBUG 1] Head layers loading status:")
+    # Head layers are typically after the backbone (after layer 185 or so)
+    # Find layers that are likely head layers (conv layers after backbone)
+    head_layers_loaded = []
+    head_layers_missing = []
+    backbone_len = 185  # Approximate backbone length
+    
+    for layer_name in stats['loaded_layers']:
+        # Find layer index
+        layer_idx = None
+        for i, layer in enumerate(model.layers):
+            if layer.name == layer_name:
+                layer_idx = i
+                break
+        if layer_idx is not None and layer_idx >= backbone_len:
+            head_layers_loaded.append((layer_name, layer_idx))
+    
+    for layer_name in stats['missing_in_weights']:
+        layer_idx = None
+        for i, layer in enumerate(model.layers):
+            if layer.name == layer_name:
+                layer_idx = i
+                break
+        if layer_idx is not None and layer_idx >= backbone_len:
+            head_layers_missing.append((layer_name, layer_idx))
+    
+    print(f"    Head layers (after backbone, layer {backbone_len}+):")
+    print(f"      Loaded: {len(head_layers_loaded)} layers")
+    if head_layers_loaded:
+        for layer_name, idx in sorted(head_layers_loaded, key=lambda x: x[1])[:10]:
+            print(f"        - {layer_name} (layer {idx})")
+        if len(head_layers_loaded) > 10:
+            print(f"        ... and {len(head_layers_loaded) - 10} more")
+    print(f"      Missing: {len(head_layers_missing)} layers")
+    if head_layers_missing:
+        for layer_name, idx in sorted(head_layers_missing, key=lambda x: x[1])[:10]:
+            print(f"        - {layer_name} (layer {idx})")
+        if len(head_layers_missing) > 10:
+            print(f"        ... and {len(head_layers_missing) - 10} more")
+    
+    # Debug check 2: Batch normalization statistics loading
+    print("\n  [DEBUG 2] Batch normalization statistics loading:")
+    bn_layers_checked = 0
+    bn_with_stats = 0
+    bn_missing_stats = []
+    
+    # Check a sample of batch normalization layers
+    for layer in model.layers:
+        if 'batch_normalization' in layer.name.lower() or isinstance(layer, tf.keras.layers.BatchNormalization):
+            bn_layers_checked += 1
+            if bn_layers_checked > 20:  # Check first 20 BN layers
+                break
+            
+            # Check if layer has moving_mean and moving_variance
+            has_moving_mean = False
+            has_moving_variance = False
+            moving_mean_val = None
+            moving_variance_val = None
+            
+            for weight in layer.weights:
+                if 'moving_mean' in weight.name:
+                    has_moving_mean = True
+                    moving_mean_val = weight.numpy()
+                elif 'moving_variance' in weight.name:
+                    has_moving_variance = True
+                    moving_variance_val = weight.numpy()
+            
+            if has_moving_mean and has_moving_variance:
+                # Check if they're non-zero (indicating they were loaded, not just initialized)
+                mean_nonzero = np.abs(moving_mean_val).mean() > 1e-6
+                var_nonzero = np.abs(moving_variance_val - 1.0).mean() > 1e-6  # Variance usually starts near 1.0
+                
+                if mean_nonzero or var_nonzero:
+                    bn_with_stats += 1
+                else:
+                    bn_missing_stats.append((layer.name, "statistics appear uninitialized"))
+            else:
+                bn_missing_stats.append((layer.name, "missing moving_mean or moving_variance"))
+    
+    print(f"    Checked {bn_layers_checked} batch normalization layers:")
+    print(f"      With loaded statistics: {bn_with_stats}")
+    print(f"      Missing/uninitialized statistics: {len(bn_missing_stats)}")
+    if bn_missing_stats:
+        for layer_name, reason in bn_missing_stats[:5]:
+            print(f"        - {layer_name}: {reason}")
+        if len(bn_missing_stats) > 5:
+            print(f"        ... and {len(bn_missing_stats) - 5} more")
+    
+    print("=" * 80 + "\n")
+    
+    return stats
 
 
 def build_multigriddet_darknet(input_shape: Tuple[int, int, int] = (416, 416, 3),
@@ -51,7 +383,7 @@ def build_multigriddet_darknet(input_shape: Tuple[int, int, int] = (416, 416, 3)
     darknet = Model(inputs, darknet53_body(inputs))
     
     if weights_path and os.path.exists(weights_path):
-        darknet.load_weights(weights_path, by_name=True)
+        load_weights_with_debug(darknet, weights_path, by_name=True)
         print(f'Loaded backbone weights from {weights_path}')
     
     # Extract feature maps
@@ -142,10 +474,12 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
     # This allows full model weights to override backbone weights if both are provided
     if weights_path and os.path.exists(weights_path):
         try:
-            model.load_weights(weights_path, by_name=True)
+            load_weights_with_debug(model, weights_path, by_name=True)
             print(f'Loaded full model weights from {weights_path}.')
         except Exception as e:
             print(f'Warning: Could not load full model weights from {weights_path}: {e}')
+            import traceback
+            traceback.print_exc()
     
     # Apply freezing based on freeze_level
     if freeze_level in [1, 2]:
@@ -189,6 +523,43 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
     # Create the training model
     training_model = Model(inputs=[model.input] + y_true, outputs=multigrid_loss)
     
+    # Verify weights are accessible in training model after wrapping
+    # The training model wraps the base model, so weights should be shared
+    sample_layer_name = None
+    sample_layer_original = None
+    if weights_path and os.path.exists(weights_path):
+        # Check if a sample layer's weights are accessible in training model
+        try:
+            # The base model layers should be directly accessible in training_model.layers
+            # Find a layer that exists in both models by name
+            for i, layer in enumerate(model.layers):
+                if hasattr(layer, 'weights') and len(layer.weights) > 0:
+                    sample_layer_name = layer.name
+                    sample_layer_original = layer
+                    break
+            
+            if sample_layer_name:
+                # Find the same layer in training model
+                sample_layer_training = None
+                for layer in training_model.layers:
+                    if layer.name == sample_layer_name and hasattr(layer, 'weights') and len(layer.weights) > 0:
+                        sample_layer_training = layer
+                        break
+                
+                if sample_layer_training and sample_layer_original:
+                    weight_after_wrap = sample_layer_training.weights[0].numpy().copy()
+                    weight_original = sample_layer_original.weights[0].numpy().copy()
+                    if np.array_equal(weight_original, weight_after_wrap):
+                        print(f'[VERIFIED] Weights accessible in training model wrapper (checked: {sample_layer_name})')
+                    else:
+                        print(f'[WARNING] Weights differ between base and training model for {sample_layer_name}!')
+                        diff = np.abs(weight_original - weight_after_wrap).mean()
+                        print(f'         Mean difference: {diff:.6f}')
+                else:
+                    print(f'[WARNING] Could not find matching layer {sample_layer_name} in training model')
+        except Exception as e:
+            print(f'[WARNING] Could not verify weights in training model: {e}')
+    
     # Set optimizer
     if optimizer is None:
         optimizer = Adam(learning_rate=1e-3)
@@ -198,6 +569,29 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         optimizer=optimizer,
         loss={'multigrid_loss': lambda y_true, y_pred: y_pred}
     )
+    
+    # Verify weights persist after compilation
+    if weights_path and os.path.exists(weights_path):
+        try:
+            # Find the same layer we checked before
+            if sample_layer_name and sample_layer_original:
+                sample_layer_training = None
+                for layer in training_model.layers:
+                    if layer.name == sample_layer_name and hasattr(layer, 'weights') and len(layer.weights) > 0:
+                        sample_layer_training = layer
+                        break
+                
+                if sample_layer_training:
+                    weight_after_compile = sample_layer_training.weights[0].numpy().copy()
+                    weight_original = sample_layer_original.weights[0].numpy().copy()
+                    if np.array_equal(weight_original, weight_after_compile):
+                        print(f'[VERIFIED] Weights preserved after compilation (checked: {sample_layer_name})')
+                    else:
+                        print(f'[ERROR] Weights changed after compilation for {sample_layer_name}! This should not happen!')
+                        diff = np.abs(weight_original - weight_after_compile).mean()
+                        print(f'         Mean difference: {diff:.6f}')
+        except Exception as e:
+            print(f'[WARNING] Could not verify weights after compilation: {e}')
     
     return training_model, backbone_len
 

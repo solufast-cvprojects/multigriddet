@@ -2489,44 +2489,25 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
                 tw = tf.math.log(box_wtoanchor_w)  # (num_final_valid,)
                 th = tf.math.log(box_htoanchor_h)  # (num_final_valid,)
                 
-                # FIXED: XY encoding - compute raw_xy targets using numerical inversion
-                # Decoding: box_xy_normalized = (tanh(0.15*raw_xy) + sigmoid(0.15*raw_xy) + cell_grid) / grid_size
-                # So: desired_offset = (box_xy_normalized * grid_size) - cell_grid
-                # Then: raw_xy = invert_activation(desired_offset)
+                # FIXED: XY encoding - store already-activated offsets matching preprocess_true_boxes
+                # preprocess_true_boxes stores: [-ki + tx, -kj + ty]
+                # NOTE: The NumPy version has a dimension swap bug where:
+                #   - cx (x coord) uses grid_shapes[layer][0] / input_shape[0] (height/height)
+                #   - cy (y coord) uses grid_shapes[layer][1] / input_shape[1] (width/width)
+                # This causes tx to be fractional y and ty to be fractional x.
+                # To match the NumPy behavior exactly, we need to swap both offsets and fractions:
+                #   - x component: -kj + ty (col offset + fractional x, stored as ty)
+                #   - y component: -ki + tx (row offset + fractional y, stored as tx)
                 
-                # Get grid size for this layer
-                grid_h_layer = tf.cast(grid_shapes[layer_idx][0], tf.float32)
-                grid_w_layer = tf.cast(grid_shapes[layer_idx][1], tf.float32)
+                # Get ki, kj offsets for each candidate (already gathered at line 2471-2472)
+                ki_final_float = tf.cast(ki_final, tf.float32)  # (num_final_valid,) - row offset
+                kj_final_float = tf.cast(kj_final, tf.float32)  # (num_final_valid,) - col offset
                 
-                # Get box center - boxes_xy is in PIXELS, need to normalize
-                box_gather_indices_xy = tf.stack([batch_idx_final, box_idx_final], axis=1)  # (num_final_valid, 2)
-                box_xy_pixels = tf.gather_nd(boxes_xy, box_gather_indices_xy)  # (num_final_valid, 2) - [x, y] in PIXELS
-                # Normalize to [0,1]
-                box_xy_normalized = box_xy_pixels / tf.stack([tf.cast(input_w, tf.float32), tf.cast(input_h, tf.float32)], axis=0)  # (num_final_valid, 2)
-                
-                # Compute cell_grid values for each candidate cell
-                # cell_grid[i, j] = [j, i] where i=row, j=col
-                kii_float = tf.cast(kii_final, tf.float32)  # (num_final_valid,) - row indices
-                kjj_float = tf.cast(kjj_final, tf.float32)  # (num_final_valid,) - col indices
-                cell_grid_x = kjj_float  # (num_final_valid,) - col (x)
-                cell_grid_y = kii_float  # (num_final_valid,) - row (y)
-                cell_grid = tf.stack([cell_grid_x, cell_grid_y], axis=1)  # (num_final_valid, 2)
-                
-                # Compute desired offset: (box_xy_normalized * grid_size) - cell_grid
-                grid_size_vec = tf.stack([grid_w_layer, grid_h_layer], axis=0)  # (2,)
-                box_xy_grid_coords = box_xy_normalized * grid_size_vec  # (num_final_valid, 2)
-                desired_offset = box_xy_grid_coords - cell_grid  # (num_final_valid, 2)
-                
-                # Invert activation to get raw_xy targets
-                desired_offset_x = desired_offset[:, 0]  # (num_final_valid,)
-                desired_offset_y = desired_offset[:, 1]  # (num_final_valid,)
-                raw_xy_x = _invert_activation_numerically(desired_offset_x)  # (num_final_valid,)
-                raw_xy_y = _invert_activation_numerically(desired_offset_y)  # (num_final_valid,)
-                raw_xy = tf.stack([raw_xy_x, raw_xy_y], axis=1)  # (num_final_valid, 2)
-                
-                # Build update vectors: [raw_xy_x, raw_xy_y, tw, th, 1.0, anchor_mask, class_one_hot]
-                # Store pre-activation raw_xy values (model will apply activation during forward pass)
-                update_xy = raw_xy  # (num_final_valid, 2)
+                # Compute already-activated offsets matching NumPy bug: [-kj + ty, -ki + tx]
+                # Note: Both offsets (ki/kj) and fractions (tx/ty) are swapped to match NumPy's dimension swap
+                update_xy_x = -kj_final_float + ty_final  # (num_final_valid,) - col offset + fractional x (stored as ty)
+                update_xy_y = -ki_final_float + tx_final  # (num_final_valid,) - row offset + fractional y (stored as tx)
+                update_xy = tf.stack([update_xy_x, update_xy_y], axis=1)  # (num_final_valid, 2)
                 update_twth = tf.stack([tw, th], axis=1)  # (num_final_valid, 2)
                 update_obj = tf.ones([num_final_valid, 1], dtype=tf.float32)  # (num_final_valid, 1)
                 

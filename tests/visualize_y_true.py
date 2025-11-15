@@ -71,8 +71,10 @@ def decode_y_true_to_boxes(y_true_list: List[np.ndarray],
             print(f"    DEBUG Layer {layer_idx}: y_true.shape={y_true.shape}, grid_h={grid_h}, grid_w={grid_w}, input_shape={input_shape}")
         num_anchors = len(anchors[layer_idx])
         
-        # Extract components - y_true stores pre-activation raw_xy and raw_wh
-        raw_xy = y_true[..., 0:2]  # [batch, grid_h, grid_w, 2] - pre-activation raw_xy
+        # Extract components - y_true stores already-activated offsets and raw_wh
+        # NOTE: y_true now stores already-activated offsets [-kj + ty, -ki + tx]
+        # (matching preprocess_true_boxes behavior)
+        stored_xy = y_true[..., 0:2]  # [batch, grid_h, grid_w, 2] - already-activated offset
         raw_wh = y_true[..., 2:4]  # [batch, grid_h, grid_w, 2] - log-space raw_wh
         objectness = y_true[..., 4:5]  # [batch, grid_h, grid_w, 1]
         anchor_one_hot = y_true[..., 5:5+num_anchors]  # [batch, grid_h, grid_w, num_anchors]
@@ -104,7 +106,7 @@ def decode_y_true_to_boxes(y_true_list: List[np.ndarray],
                     continue
                 
                 # Get values at this cell
-                cell_raw_xy = raw_xy[0, i, j, :]  # [2] - pre-activation raw_xy
+                cell_stored_xy = stored_xy[0, i, j, :]  # [2] - already-activated offset
                 cell_raw_wh = raw_wh[0, i, j, :]  # [2] - log-space raw_wh
                 cell_anchor = anchor_one_hot[0, i, j, :]  # [num_anchors]
                 cell_class = class_one_hot[0, i, j, :]  # [num_classes]
@@ -116,9 +118,9 @@ def decode_y_true_to_boxes(y_true_list: List[np.ndarray],
                 # Get class index
                 class_idx = np.argmax(cell_class)
                 
-                # Decode using the SAME logic as multigrid_decode.py
-                # Step 1: Apply activation to raw_xy
-                activated_xy = np.tanh(0.15 * cell_raw_xy) + expit(0.15 * cell_raw_xy)  # [2]
+                # Decode y_true targets (already-activated offsets, no need to apply activation)
+                # Step 1: stored_xy is already activated (no activation needed)
+                activated_xy = cell_stored_xy  # Already activated: [-kj + ty, -ki + tx]
                 
                 # Step 2: Add cell_grid offset
                 cell_grid_val = cell_grid[i, j, :]  # [2] - [j, i] = [x, y]
@@ -134,7 +136,8 @@ def decode_y_true_to_boxes(y_true_list: List[np.ndarray],
                 
                 # Debug for first few cells
                 if len(boxes) < 3 and i < 20 and j < 20:
-                    print(f"      DEBUG cell ({i}, {j}): activated_xy=({activated_xy[0]:.3f}, {activated_xy[1]:.3f}), "
+                    print(f"      DEBUG cell ({i}, {j}): stored_xy=({cell_stored_xy[0]:.3f}, {cell_stored_xy[1]:.3f}), "
+                          f"activated_xy=({activated_xy[0]:.3f}, {activated_xy[1]:.3f}), "
                           f"cell_grid=({cell_grid_val[0]}, {cell_grid_val[1]}), "
                           f"box_xy_grid=({box_xy_grid[0]:.3f}, {box_xy_grid[1]:.3f}), "
                           f"normalized=({box_xy_normalized[0]:.6f}, {box_xy_normalized[1]:.6f}), "

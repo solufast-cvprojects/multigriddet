@@ -14,7 +14,7 @@ import os
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from multigriddet.data.generators import tf_preprocess_true_boxes, _invert_activation_numerically
+from multigriddet.data.generators import tf_preprocess_true_boxes
 
 
 def test_9cell_alignment():
@@ -87,18 +87,20 @@ def test_9cell_alignment():
         for cell_idx in range(num_cells):
             i, j = cells_with_objects[0][cell_idx], cells_with_objects[1][cell_idx]
             
-            # Get raw_xy and raw_wh from y_true
-            raw_xy = y_true[0, i, j, 0:2]  # (2,)
+            # Get stored_xy and raw_wh from y_true
+            # NOTE: y_true now stores already-activated offsets [-kj + ty, -ki + tx]
+            # (matching preprocess_true_boxes behavior)
+            stored_xy = y_true[0, i, j, 0:2]  # (2,) - already-activated offset
             raw_wh = y_true[0, i, j, 2:4]  # (2,)
             anchor_one_hot = y_true[0, i, j, 5:5+len(anchors[layer_idx])]
             anchor_idx = np.argmax(anchor_one_hot)
             anchor = anchors[layer_idx][anchor_idx].numpy()
             
-            raw_xy_values.append(raw_xy.copy())
+            raw_xy_values.append(stored_xy.copy())
             
-            # Decode using the same logic as multigrid_decode.py
-            # Step 1: Apply activation
-            activated_xy = np.tanh(0.15 * raw_xy) + expit(0.15 * raw_xy)
+            # Decode y_true targets (already-activated offsets, no need to apply activation)
+            # Step 1: stored_xy is already activated (no activation needed)
+            activated_xy = stored_xy  # Already activated: [-kj + ty, -ki + tx]
             
             # Step 2: Add cell_grid offset
             cell_grid = np.array([j, i])  # [x, y] = [j, i]
@@ -114,7 +116,7 @@ def test_9cell_alignment():
             decoded_centers.append([decoded_cx, decoded_cy])
             
             if cell_idx < 9:  # Print first 9
-                print(f"    Cell ({i:2d}, {j:2d}): raw_xy=({raw_xy[0]:7.3f}, {raw_xy[1]:7.3f})",
+                print(f"    Cell ({i:2d}, {j:2d}): stored_xy=({stored_xy[0]:7.3f}, {stored_xy[1]:7.3f})",
                     f"box_xy_grid=({box_xy_grid[0]:7.3f}, {box_xy_grid[1]:7.3f})",
                     f"activated_xy=({activated_xy[0]:7.3f}, {activated_xy[1]:7.3f})",    
                     f"box_xy_normalized=({box_xy_normalized[0]:7.3f}, {box_xy_normalized[1]:7.3f})",
@@ -168,11 +170,11 @@ def test_9cell_alignment():
             print(f"    ✗ FAIL: Some cells are off by more than 1 pixel")
             print(f"    This suggests the numerical inversion may not be precise enough")
         
-        # Also check raw_xy values - they should be different for each cell
-        raw_xy_array = np.array(raw_xy_values)
-        print(f"\n  Raw_xy values (should be different for each cell):")
-        print(f"    Range x: [{np.min(raw_xy_array[:, 0]):.3f}, {np.max(raw_xy_array[:, 0]):.3f}]")
-        print(f"    Range y: [{np.min(raw_xy_array[:, 1]):.3f}, {np.max(raw_xy_array[:, 1]):.3f}]")
+        # Also check stored_xy values - they should be different for each cell
+        stored_xy_array = np.array(raw_xy_values)
+        print(f"\n  Stored_xy values (already-activated offsets, should be different for each cell):")
+        print(f"    Range x: [{np.min(stored_xy_array[:, 0]):.3f}, {np.max(stored_xy_array[:, 0]):.3f}]")
+        print(f"    Range y: [{np.min(stored_xy_array[:, 1]):.3f}, {np.max(stored_xy_array[:, 1]):.3f}]")
 
 
 if __name__ == '__main__':

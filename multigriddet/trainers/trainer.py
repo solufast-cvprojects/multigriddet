@@ -459,7 +459,12 @@ class MultiGridTrainer:
             for layer in self.model.layers:
                 layer.trainable = True
             
-            # Model is already compiled with custom loss, no need to recompile
+            # Recompile model to refresh trainable variables after unfreezing
+            # Get optimizer and loss from current model
+            optimizer = self.model.optimizer
+            loss = self.model.loss
+            self.model.compile(optimizer=optimizer, loss=loss)
+            print(f"   Model recompiled to refresh trainable variables")
             
             initial_epoch = transfer_epochs
         
