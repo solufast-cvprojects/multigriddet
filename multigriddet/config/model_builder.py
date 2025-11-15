@@ -116,6 +116,11 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     'anchor_scale': loss_config.get('anchor_scale', 1.0),
                 }
             
+            # Extract loss normalization configuration
+            loss_normalization = training_config.get('loss_normalization', None)
+            if loss_normalization is not None:
+                loss_scales['loss_normalization'] = loss_normalization
+            
             # Compute class weights for handling class imbalance
             class_weights_config = training_config.get('class_weights', None)
             if class_weights_config is not None:

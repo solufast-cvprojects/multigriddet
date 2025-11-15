@@ -20,6 +20,9 @@ from typing import Tuple, List, Optional, Dict, Any
 import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Debug flag for augmentation pipeline (set to True to enable debug prints/asserts)
+DEBUG_AUG_PIPELINE = False
+
 # Import utility functions from local modules
 from .augmentation import (
     normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes,
@@ -443,16 +446,14 @@ def tf_random_rotate(image: tf.Tensor,
         # For arbitrary angles, we need to use tf.raw_ops.ImageProjectiveTransformV3 or similar
         
         # For now, use discrete 90-degree rotations (can be extended)
-        # Randomly choose one of 0, 90, 180, 270 degree rotations
-        k = tf.cast(tf.random.uniform([], 0, 4, dtype=tf.int32), tf.int32)
+        # Randomly choose one of 90, 180, 270 degree rotations (exclude 0 to ensure visible rotation)
+        # k=1: 90°, k=2: 180°, k=3: 270°
+        k = tf.cast(tf.random.uniform([], 1, 4, dtype=tf.int32), tf.int32)
         image_rotated = tf.image.rot90(image, k=k)
         
         # Transform boxes for 90-degree rotations
         def rotate_boxes_90(boxes, k_rot):
             x1, y1, x2, y2, cls = tf.split(boxes, 5, axis=-1)
-            
-            def rot0():
-                return boxes
             
             def rot1():  # 90 degrees
                 new_x1 = y1
@@ -475,8 +476,8 @@ def tf_random_rotate(image: tf.Tensor,
                 new_y2 = x2
                 return tf.concat([new_x1, new_y1, new_x2, new_y2, cls], axis=-1)
             
+            # k is guaranteed to be in [1, 2, 3], so we only need these cases
             return tf.case([
-                (tf.equal(k_rot, 0), rot0),
                 (tf.equal(k_rot, 1), rot1),
                 (tf.equal(k_rot, 2), rot2),
             ], default=rot3)
@@ -728,9 +729,116 @@ def tf_random_mosaic(images: tf.Tensor,
                 area_right = tf.concat([area_3, area_2], axis=0)
                 merged_img = tf.concat([area_left, area_right], axis=1)
                 
-                # Merge boxes (simplified - just take boxes from first image for now)
-                # Full box merging would be more complex
-                merged_boxes = box0  # Simplified: use boxes from first image
+                # Merge boxes from all 4 quadrants with proper coordinate shifting
+                max_boxes_per_image = tf.shape(boxes)[1]
+                
+                def merge_boxes_for_quadrant(boxes_quad, quadrant_idx, crop_x_f, crop_y_f, width, height):
+                    """Merge boxes for a specific quadrant.
+                    
+                    Mosaic layout in combined image (all images are same size, so coordinates match):
+                    -----------
+                    |  0  | 3 |  (0,0) to (crop_x, crop_y) and (crop_x, 0) to (width, crop_y)
+                    -----------
+                    |  1  | 2 |  (0, crop_y) to (crop_x, height) and (crop_x, crop_y) to (width, height)
+                    -----------
+                    
+                    Since all images are resized to the same input_shape, boxes are in the same
+                    coordinate system. We just need to clip them to the crop boundaries.
+                    No coordinate shifting is needed because crops are placed at same positions.
+                    """
+                    # Filter valid boxes (non-zero)
+                    box_areas = (boxes_quad[:, 2] - boxes_quad[:, 0]) * (boxes_quad[:, 3] - boxes_quad[:, 1])
+                    valid_mask = box_areas > 0.0
+                    
+                    x1 = boxes_quad[:, 0]
+                    y1 = boxes_quad[:, 1]
+                    x2 = boxes_quad[:, 2]
+                    y2 = boxes_quad[:, 3]
+                    cls = boxes_quad[:, 4]
+                    
+                    if quadrant_idx == 0:  # Top-left: placed at (0, 0) to (crop_x, crop_y)
+                        # Keep boxes that overlap with top-left crop area
+                        keep = tf.logical_and(tf.logical_and(y2 > 0.0, y1 < crop_y_f), 
+                                            tf.logical_and(x2 > 0.0, x1 < crop_x_f))
+                        keep = tf.logical_and(keep, valid_mask)
+                        # Clip to crop boundaries (no shift needed - already at origin)
+                        x1_new = tf.maximum(x1, 0.0)
+                        y1_new = tf.maximum(y1, 0.0)
+                        x2_new = tf.minimum(x2, crop_x_f)
+                        y2_new = tf.minimum(y2, crop_y_f)
+                        
+                    elif quadrant_idx == 1:  # Bottom-left: placed at (0, crop_y) to (crop_x, height)
+                        # Keep boxes that overlap with bottom-left crop area [0, crop_x] x [crop_y, height]
+                        keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, y1 < height), 
+                                            tf.logical_and(x2 > 0.0, x1 < crop_x_f))
+                        keep = tf.logical_and(keep, valid_mask)
+                        # Clip to crop boundaries (coordinates already match - no shift needed)
+                        x1_new = tf.maximum(x1, 0.0)
+                        y1_new = tf.maximum(y1, crop_y_f)  # Clip y_min to crop_y
+                        x2_new = tf.minimum(x2, crop_x_f)
+                        y2_new = tf.minimum(y2, height)
+                        
+                    elif quadrant_idx == 2:  # Bottom-right: placed at (crop_x, crop_y) to (width, height)
+                        # Keep boxes that overlap with bottom-right crop area [crop_x, width] x [crop_y, height]
+                        keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, y1 < height), 
+                                            tf.logical_and(x2 > crop_x_f, x1 < width))
+                        keep = tf.logical_and(keep, valid_mask)
+                        # Clip to crop boundaries (coordinates already match - no shift needed)
+                        x1_new = tf.maximum(x1, crop_x_f)  # Clip x_min to crop_x
+                        y1_new = tf.maximum(y1, crop_y_f)  # Clip y_min to crop_y
+                        x2_new = tf.minimum(x2, width)
+                        y2_new = tf.minimum(y2, height)
+                        
+                    else:  # quadrant_idx == 3, Top-right: placed at (crop_x, 0) to (width, crop_y)
+                        # Keep boxes that overlap with top-right crop area [crop_x, width] x [0, crop_y]
+                        keep = tf.logical_and(tf.logical_and(y2 > 0.0, y1 < crop_y_f), 
+                                            tf.logical_and(x2 > crop_x_f, x1 < width))
+                        keep = tf.logical_and(keep, valid_mask)
+                        # Clip to crop boundaries (coordinates already match - no shift needed)
+                        x1_new = tf.maximum(x1, crop_x_f)  # Clip x_min to crop_x
+                        y1_new = tf.maximum(y1, 0.0)
+                        x2_new = tf.minimum(x2, width)
+                        y2_new = tf.minimum(y2, crop_y_f)
+                    
+                    # Filter by minimum size (1% of image or 10 pixels)
+                    box_w = x2_new - x1_new
+                    box_h = y2_new - y1_new
+                    min_size = tf.maximum(10.0, tf.minimum(width, height) * 0.01)
+                    size_keep = tf.logical_and(box_w >= min_size, box_h >= min_size)
+                    keep = tf.logical_and(keep, size_keep)
+                    
+                    # Combine coordinates
+                    boxes_merged = tf.stack([x1_new, y1_new, x2_new, y2_new, cls], axis=1)
+                    
+                    return boxes_merged, keep
+                
+                # Merge boxes from each quadrant
+                boxes_0, keep_0 = merge_boxes_for_quadrant(box0, 0, crop_x_f, crop_y_f, width, height)
+                boxes_1, keep_1 = merge_boxes_for_quadrant(box1, 1, crop_x_f, crop_y_f, width, height)
+                boxes_2, keep_2 = merge_boxes_for_quadrant(box2, 2, crop_x_f, crop_y_f, width, height)
+                boxes_3, keep_3 = merge_boxes_for_quadrant(box3, 3, crop_x_f, crop_y_f, width, height)
+                
+                # Concatenate all valid boxes
+                all_boxes = []
+                
+                for boxes_q, keep_q in [(boxes_0, keep_0), (boxes_1, keep_1), (boxes_2, keep_2), (boxes_3, keep_3)]:
+                    valid_boxes = tf.boolean_mask(boxes_q, keep_q)
+                    all_boxes.append(valid_boxes)
+                
+                # Concatenate all valid boxes
+                if len(all_boxes) > 0:
+                    merged_boxes = tf.concat(all_boxes, axis=0)
+                else:
+                    # No valid boxes, create empty box
+                    merged_boxes = tf.zeros([0, 5], dtype=tf.float32)
+                
+                # Pad or truncate to max_boxes_per_image
+                num_boxes = tf.shape(merged_boxes)[0]
+                if num_boxes > max_boxes_per_image:
+                    merged_boxes = merged_boxes[:max_boxes_per_image]
+                elif num_boxes < max_boxes_per_image:
+                    padding = tf.zeros([max_boxes_per_image - num_boxes, 5], dtype=tf.float32)
+                    merged_boxes = tf.concat([merged_boxes, padding], axis=0)
                 
                 return merged_img, merged_boxes
             
@@ -1399,16 +1507,21 @@ class MultiGridDataGenerator(Sequence):
             
             # Apply augmentations if enabled
             if self.augment:
-                # Random resize crop pad (replaces the old PIL-based version)
+                # Random resize crop pad (always applied - essential for scale and aspect ratio diversity)
+                # This augmentation provides crucial scale and aspect ratio jittering without
+                # being too aggressive, as it maintains object visibility
                 image_resized, boxes, _, _ = tf_random_resize_crop_pad(
                     image_resized, self.input_shape, boxes,
                     aspect_ratio_jitter=0.3, scale_jitter=0.5
                 )
                 
                 # Random horizontal flip
+                # Standard 50% probability (hardcoded in function) - provides left-right invariance
+                # without being too aggressive
                 image_resized, boxes = tf_random_horizontal_flip(image_resized, boxes)
                 
-                # Color augmentations
+                # Color augmentations (always applied - non-destructive)
+                # These augmentations preserve geometric properties and only modify pixel values
                 image_resized = tf_random_brightness(image_resized, max_delta=0.2)
                 image_resized = tf_random_contrast(image_resized, lower=0.8, upper=1.2)
                 image_resized = tf_random_saturation(image_resized, lower=0.8, upper=1.2)
@@ -1416,10 +1529,14 @@ class MultiGridDataGenerator(Sequence):
                 image_resized = tf_random_grayscale(image_resized, probability=0.1)
                 
                 # Random rotate
-                image_resized, boxes = tf_random_rotate(image_resized, boxes, rotate_range=20.0, prob=0.1)
+                # Reduced probability (0.05 = 5%) to avoid excessive geometric distortion
+                # Rotation can significantly alter object appearance and context
+                image_resized, boxes = tf_random_rotate(image_resized, boxes, rotate_range=20.0, prob=0.05)
                 
                 # Random gridmask
-                image_resized, boxes = tf_random_gridmask(image_resized, boxes, prob=0.2)
+                # Reduced probability (0.1 = 10%) to balance regularization with data quality
+                # GridMask can obscure important object features if applied too frequently
+                image_resized, boxes = tf_random_gridmask(image_resized, boxes, prob=0.1)
             
             return image_resized, boxes
         
@@ -1446,13 +1563,17 @@ class MultiGridDataGenerator(Sequence):
         if self.augment:
             def _apply_batch_augmentations(images, boxes_dense):
                 """Apply batch-level augmentations (Mosaic, MixUp)."""
-                # Apply Mosaic if enabled (high probability for high impact)
+                # Apply Mosaic if enabled
+                # High probability (0.9 = 90%) as it's highly effective for object detection
+                # Mosaic combines 4 images, increasing effective batch size and context diversity
                 if self.enhance_augment == 'mosaic':
-                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=1.0)
+                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=0.9)
                 
-                # Apply MixUp with lower probability (to avoid over-augmentation)
-                # MixUp can be combined with Mosaic or used alone
-                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=0.15, alpha=0.2)
+                # Apply MixUp with reduced probability to prevent over-augmentation
+                # MixUp blends two images, which can make objects hard to distinguish
+                # Reduced from 0.15 to 0.05 (5%) to maintain data quality while still providing
+                # regularization benefits. MixUp can be combined with Mosaic or used alone.
+                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=0.05, alpha=0.2)
                 
                 return images, boxes_dense
             
@@ -1870,7 +1991,8 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
                              anchors: List[tf.Tensor],
                              num_classes: int,
                              multi_anchor_assign: bool,
-                             grid_shapes: List[Tuple[int, int]]) -> List[tf.Tensor]:
+                             grid_shapes: List[Tuple[int, int]],
+                             debug_aug_pipeline: bool = False) -> List[tf.Tensor]:
     """
     Fully vectorized TensorFlow implementation of preprocess_true_boxes.
     
@@ -1892,31 +2014,29 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
     num_layers = len(anchors)
     input_h, input_w = input_shape
     
-    # Debug: Assert input shape
+    # Essential input validation (always enabled for safety)
     tf.debugging.assert_equal(tf.rank(true_boxes), 3, message="true_boxes must be rank 3: (batch, max_boxes, 5)")
     tf.debugging.assert_equal(tf.shape(true_boxes)[2], 5, message="true_boxes last dim must be 5")
     
     # Convert boxes from (x1, y1, x2, y2, class) to (cx, cy, w, h, class)
-    # CRITICAL: Ensure true_boxes has the correct shape before processing
-    true_boxes_shape = tf.shape(true_boxes)
-    tf.print("DEBUG: true_boxes shape =", true_boxes_shape, output_stream=tf.compat.v1.logging.info)
-    
     boxes_xy = (true_boxes[..., 0:2] + true_boxes[..., 2:4]) / 2.0  # (batch, max_boxes, 2)
     boxes_wh = true_boxes[..., 2:4] - true_boxes[..., 0:2]  # (batch, max_boxes, 2)
     boxes_class = tf.cast(true_boxes[..., 4:5], tf.int32)  # (batch, max_boxes, 1)
     
-    # Debug: Assert intermediate shapes with explicit checks
-    boxes_xy_shape = tf.shape(boxes_xy)
-    boxes_wh_shape = tf.shape(boxes_wh)
-    boxes_class_shape = tf.shape(boxes_class)
-    
-    tf.print("DEBUG: boxes_xy shape =", boxes_xy_shape, "boxes_wh shape =", boxes_wh_shape, "boxes_class shape =", boxes_class_shape, output_stream=tf.compat.v1.logging.info)
-    
-    # Ensure boxes_wh has rank 3
+    # Essential validation (always enabled)
     tf.debugging.assert_equal(tf.rank(boxes_wh), 3, message="boxes_wh must be rank 3")
-    tf.debugging.assert_equal(boxes_wh_shape[0], batch_size, message="boxes_wh batch dimension mismatch")
-    tf.debugging.assert_equal(boxes_wh_shape[1], max_boxes, message="boxes_wh max_boxes dimension mismatch")
-    tf.debugging.assert_equal(boxes_wh_shape[2], 2, message="boxes_wh last dimension must be 2")
+    
+    # Debug prints and additional asserts (only if debug_aug_pipeline is enabled)
+    if debug_aug_pipeline:
+        true_boxes_shape = tf.shape(true_boxes)
+        tf.print("DEBUG: true_boxes shape =", true_boxes_shape, output_stream=tf.compat.v1.logging.info)
+        boxes_xy_shape = tf.shape(boxes_xy)
+        boxes_wh_shape = tf.shape(boxes_wh)
+        boxes_class_shape = tf.shape(boxes_class)
+        tf.print("DEBUG: boxes_xy shape =", boxes_xy_shape, "boxes_wh shape =", boxes_wh_shape, "boxes_class shape =", boxes_class_shape, output_stream=tf.compat.v1.logging.info)
+        tf.debugging.assert_equal(boxes_wh_shape[0], batch_size, message="boxes_wh batch dimension mismatch")
+        tf.debugging.assert_equal(boxes_wh_shape[1], max_boxes, message="boxes_wh max_boxes dimension mismatch")
+        tf.debugging.assert_equal(boxes_wh_shape[2], 2, message="boxes_wh last dimension must be 2")
     
     # Filter out invalid boxes (where w*h <= 0)
     # CRITICAL FIX: Use explicit indexing to ensure correct shape
@@ -1927,33 +2047,34 @@ def tf_preprocess_true_boxes(true_boxes: tf.Tensor,
     box_areas = box_w * box_h  # (batch, max_boxes)
     valid_mask = box_areas > 0.0  # (batch, max_boxes)
     
-    # Debug: Assert shapes after computation
-    box_w_shape = tf.shape(box_w)
-    box_w_rank = tf.rank(box_w)
-    box_h_shape = tf.shape(box_h)
-    box_h_rank = tf.rank(box_h)
-    box_areas_shape = tf.shape(box_areas)
-    box_areas_rank = tf.rank(box_areas)
-    valid_mask_shape = tf.shape(valid_mask)
-    valid_mask_rank = tf.rank(valid_mask)
-    
-    tf.print("DEBUG: box_w shape =", box_w_shape, "rank =", box_w_rank, output_stream=tf.compat.v1.logging.info)
-    tf.print("DEBUG: box_h shape =", box_h_shape, "rank =", box_h_rank, output_stream=tf.compat.v1.logging.info)
-    tf.print("DEBUG: box_areas shape =", box_areas_shape, "rank =", box_areas_rank, output_stream=tf.compat.v1.logging.info)
-    tf.print("DEBUG: valid_mask shape =", valid_mask_shape, "rank =", valid_mask_rank, output_stream=tf.compat.v1.logging.info)
-    
-    # Ensure box_w and box_h have rank 2
-    tf.debugging.assert_equal(box_w_rank, 2, message="box_w must be rank 2")
-    tf.debugging.assert_equal(box_h_rank, 2, message="box_h must be rank 2")
-    tf.debugging.assert_equal(box_w_shape[0], batch_size, message="box_w batch dimension mismatch")
-    tf.debugging.assert_equal(box_w_shape[1], max_boxes, message="box_w max_boxes dimension mismatch")
-    tf.debugging.assert_equal(box_h_shape[0], batch_size, message="box_h batch dimension mismatch")
-    tf.debugging.assert_equal(box_h_shape[1], max_boxes, message="box_h max_boxes dimension mismatch")
-    
-    # Ensure valid_mask has rank 2 and correct dimensions
-    tf.debugging.assert_equal(valid_mask_rank, 2, message="valid_mask must be rank 2")
-    tf.debugging.assert_equal(valid_mask_shape[0], batch_size, message="valid_mask batch dimension mismatch")
-    tf.debugging.assert_equal(valid_mask_shape[1], max_boxes, message="valid_mask max_boxes dimension mismatch")
+    # Debug prints and asserts (only if debug_aug_pipeline is enabled)
+    if debug_aug_pipeline:
+        box_w_shape = tf.shape(box_w)
+        box_w_rank = tf.rank(box_w)
+        box_h_shape = tf.shape(box_h)
+        box_h_rank = tf.rank(box_h)
+        box_areas_shape = tf.shape(box_areas)
+        box_areas_rank = tf.rank(box_areas)
+        valid_mask_shape = tf.shape(valid_mask)
+        valid_mask_rank = tf.rank(valid_mask)
+        
+        tf.print("DEBUG: box_w shape =", box_w_shape, "rank =", box_w_rank, output_stream=tf.compat.v1.logging.info)
+        tf.print("DEBUG: box_h shape =", box_h_shape, "rank =", box_h_rank, output_stream=tf.compat.v1.logging.info)
+        tf.print("DEBUG: box_areas shape =", box_areas_shape, "rank =", box_areas_rank, output_stream=tf.compat.v1.logging.info)
+        tf.print("DEBUG: valid_mask shape =", valid_mask_shape, "rank =", valid_mask_rank, output_stream=tf.compat.v1.logging.info)
+        
+        # Ensure box_w and box_h have rank 2
+        tf.debugging.assert_equal(box_w_rank, 2, message="box_w must be rank 2")
+        tf.debugging.assert_equal(box_h_rank, 2, message="box_h must be rank 2")
+        tf.debugging.assert_equal(box_w_shape[0], batch_size, message="box_w batch dimension mismatch")
+        tf.debugging.assert_equal(box_w_shape[1], max_boxes, message="box_w max_boxes dimension mismatch")
+        tf.debugging.assert_equal(box_h_shape[0], batch_size, message="box_h batch dimension mismatch")
+        tf.debugging.assert_equal(box_h_shape[1], max_boxes, message="box_h max_boxes dimension mismatch")
+        
+        # Ensure valid_mask has rank 2 and correct dimensions
+        tf.debugging.assert_equal(valid_mask_rank, 2, message="valid_mask must be rank 2")
+        tf.debugging.assert_equal(valid_mask_shape[0], batch_size, message="valid_mask batch dimension mismatch")
+        tf.debugging.assert_equal(valid_mask_shape[1], max_boxes, message="valid_mask max_boxes dimension mismatch")
     
     # Initialize output tensors
     y_true = []

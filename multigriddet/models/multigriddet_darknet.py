@@ -498,6 +498,8 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
     y_true = [Input(shape=(None, None, num_anchors_per_head[l] + num_classes + 5), name=f'y_true_{l}') for l in range(num_feature_layers)]
     
     # Create the MultiGridLoss function
+    # Extract loss_normalization from kwargs if provided
+    loss_normalization = kwargs.pop('loss_normalization', None)
     multigrid_loss_fn = MultiGridLoss(
         anchors=anchors,
         num_classes=num_classes,
@@ -510,7 +512,8 @@ def build_multigriddet_darknet_train(anchors: List[np.ndarray],
         no_object_scale=no_object_scale,
         class_scale=class_scale,
         anchor_scale=anchor_scale,
-        class_weights=class_weights
+        class_weights=class_weights,
+        loss_normalization=loss_normalization
     )
     
     # Create loss layer using Lambda

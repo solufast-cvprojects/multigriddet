@@ -437,7 +437,8 @@ class MultiGridTrainer:
         if transfer_epochs > 0 and initial_epoch < transfer_epochs:
             print(f"🔒 Stage 1: Transfer Learning ({transfer_epochs} epochs with frozen backbone)")
             
-            # Freeze backbone layers
+            # Freeze backbone layers only if transfer_epochs > 0
+            # When transfer_epochs == 0, fine-tuning runs without frozen backbone
             freeze_level = training_config.get('freeze_level', 1)
             if freeze_level > 0:
                 # Freeze backbone (first 185 layers for darknet53)
