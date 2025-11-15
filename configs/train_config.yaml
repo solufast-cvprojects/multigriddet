@@ -42,6 +42,19 @@ training:
     class_scale: 1.0       # Scale for classification loss
     anchor_scale: 1.0      # Scale for anchor prediction loss
 
+  # Loss normalization strategy
+  # Controls how loss values are normalized to ensure stable training and comparable metrics
+  # Options (can combine multiple, they multiply together):
+  #   - "batch": Normalize by batch size (default, recommended for consistent scaling)
+  #   - "positives": Normalize by number of positive cells (varies per batch, adapts to data)
+  #   - "grid": Normalize by batch_size * grid_h * grid_w (total grid cells)
+  # Examples:
+  #   ["batch"] - Default: normalize by batch size only
+  #   ["positives"] - Normalize by number of objects (useful for imbalanced datasets)
+  #   ["batch", "grid"] - Normalize by both batch size and grid size
+  loss_normalization: ["batch"]  # Default: batch-size normalization
+
+
   # Class weights for handling class imbalance
   # Options:
   #   - 'auto': Automatically compute from training data (recommended)
