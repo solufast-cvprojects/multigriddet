@@ -28,15 +28,30 @@ def create_optimizer_from_config(config: Dict[str, Any]) -> tf.keras.optimizers.
     - AdamW: Adam with decoupled weight decay (recommended for modern training)
     - SGD: Stochastic Gradient Descent with momentum
     
+    Learning rate priority:
+    1. training.learning_rate (primary source for user convenience)
+    2. optimizer.learning_rate (explicit override if provided)
+    3. Default: 0.001
+    
     Args:
-        config: Configuration dictionary with 'optimizer' key
+        config: Configuration dictionary with 'optimizer' and optionally 'training' keys
         
     Returns:
         Configured optimizer instance
     """
     optimizer_config = config.get('optimizer', {})
+    training_config = config.get('training', {})
     opt_type = optimizer_config.get('type', 'adam').lower()
-    learning_rate = optimizer_config.get('learning_rate', 0.001)
+    
+    # Learning rate priority: training.learning_rate > optimizer.learning_rate > default
+    # This allows users to set training.learning_rate as the primary way to control LR,
+    # while optimizer.learning_rate serves as an explicit override
+    if 'learning_rate' in training_config:
+        learning_rate = training_config['learning_rate']
+    elif 'learning_rate' in optimizer_config:
+        learning_rate = optimizer_config['learning_rate']
+    else:
+        learning_rate = 0.001
     
     if opt_type == 'adamw':
         # AdamW: Modern standard, uses weight_decay parameter
@@ -154,9 +169,18 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
             optimizer = create_optimizer_from_config(config)
         
         # Get freeze_level from training config if for training
-        freeze_level = 1  # Default
+        # When transfer_epochs=0, we don't freeze (freeze_level=0) to allow full fine-tuning
+        # When transfer_epochs>0, we use the configured freeze_level for two-stage training
+        freeze_level = 0  # Default: no freezing (for full fine-tuning)
         if for_training and 'training' in config:
-            freeze_level = config['training'].get('freeze_level', 1)
+            training_config = config['training']
+            transfer_epochs = training_config.get('transfer_epochs', 0)
+            if transfer_epochs > 0:
+                # Two-stage training: use configured freeze_level
+                freeze_level = training_config.get('freeze_level', 1)
+            else:
+                # Single-stage training: no freezing (freeze_level=0)
+                freeze_level = 0
         
         if architecture == 'multigriddet_darknet':
             if for_training:

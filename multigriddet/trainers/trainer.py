@@ -368,9 +368,16 @@ class MultiGridTrainer:
             if schedule_type == 'cosine_annealing':
                 # Modern cosine annealing with warmup (recommended)
                 training_config = self.config.get('training', {})
+                optimizer_config = self.config.get('optimizer', {})
                 total_epochs = training_config.get('epochs', 100)
-                initial_lr = self.config.get('optimizer', {}).get('learning_rate', 
-                                                                  training_config.get('learning_rate', 0.001))
+                # Learning rate priority: training.learning_rate > optimizer.learning_rate > default
+                # This matches the priority used in create_optimizer_from_config
+                if 'learning_rate' in training_config:
+                    initial_lr = training_config['learning_rate']
+                elif 'learning_rate' in optimizer_config:
+                    initial_lr = optimizer_config['learning_rate']
+                else:
+                    initial_lr = 0.001
                 
                 cosine_lr = CosineAnnealingWithWarmup(
                     initial_lr=initial_lr,
@@ -481,10 +488,15 @@ class MultiGridTrainer:
             # Extract learning rate as Python float to avoid tensor-to-numpy conversion issues
             # This prevents the "numpy() is only available when eager execution is enabled" error
             # We avoid calling .numpy() on tensors by using config values instead
+            # Learning rate priority: training.learning_rate > optimizer.learning_rate > default
             training_config = self.config.get('training', {})
             optimizer_config = self.config.get('optimizer', {})
-            current_lr = optimizer_config.get('learning_rate', 
-                                              training_config.get('learning_rate', 0.001))
+            if 'learning_rate' in training_config:
+                current_lr = training_config['learning_rate']
+            elif 'learning_rate' in optimizer_config:
+                current_lr = optimizer_config['learning_rate']
+            else:
+                current_lr = 0.001
             
             # Try to get the current learning rate if it's a simple float (not a tensor)
             # This avoids tensor-to-numpy conversion that requires eager execution
