@@ -201,6 +201,16 @@ examples/camera_frame_*.jpg
 examples/inference_result.jpg
 examples/camera_inference_output.mp4
 
+# Config files (use .example files as templates)
+configs/train_config.yaml
+configs/train_config_test.yaml
+configs/infer_config.yaml
+configs/eval_config.yaml
+configs/eval_config_full.yaml
+configs/eval_config_test.yaml
+configs/eval_config_test_viz.yaml
+configs/eval_config_fast.yaml
+
 # Test outputs
 test_*.jpg
 test_*.mp4

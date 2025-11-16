@@ -163,6 +163,55 @@ def load_weights_with_debug(model: Model, weights_path: str, by_name: bool = Tru
         model.load_weights(weights_path, by_name=by_name)
         print(f"  [SUCCESS] Weight loading completed without exceptions")
         
+        # Manually load BN statistics (fix for nested structure issue with by_name=True)
+        # Keras load_weights(by_name=True) sometimes fails to load nested BN statistics correctly
+        # We manually load all BN statistics to ensure they're properly loaded
+        try:
+            with h5py.File(weights_path, 'r') as f:
+                if 'model_weights' in f:
+                    model_weights = f['model_weights']
+                    bn_loaded_count = 0
+                    bn_failed_count = 0
+                    
+                    # Create a mapping of layer names to model layers for faster lookup
+                    model_layer_map = {layer.name: layer for layer in model.layers}
+                    
+                    for layer_name in model_weights.keys():
+                        if 'batch_normalization' in layer_name.lower():
+                            # Find corresponding layer in model
+                            model_layer = model_layer_map.get(layer_name)
+                            
+                            if model_layer and isinstance(model_layer, tf.keras.layers.BatchNormalization):
+                                layer_group = model_weights[layer_name]
+                                # Check nested structure: layer_name/batch_normalization/moving_mean:0
+                                if 'batch_normalization' in layer_group:
+                                    bn_group = layer_group['batch_normalization']
+                                    if 'moving_mean:0' in bn_group and 'moving_variance:0' in bn_group:
+                                        try:
+                                            # Load BN statistics from file
+                                            file_mean = np.array(bn_group['moving_mean:0'])
+                                            file_var = np.array(bn_group['moving_variance:0'])
+                                            
+                                            # Set the weights directly
+                                            for weight in model_layer.weights:
+                                                if 'moving_mean' in weight.name:
+                                                    weight.assign(file_mean)
+                                                elif 'moving_variance' in weight.name:
+                                                    weight.assign(file_var)
+                                            
+                                            bn_loaded_count += 1
+                                        except Exception as e:
+                                            bn_failed_count += 1
+                    
+                    if bn_loaded_count > 0:
+                        print(f"  [INFO] Manually loaded BN statistics for {bn_loaded_count} layers")
+                    if bn_failed_count > 0:
+                        print(f"  [WARNING] Failed to load BN statistics for {bn_failed_count} layers")
+        except Exception as e:
+            print(f"  [WARNING] Could not manually load BN statistics: {e}")
+            import traceback
+            traceback.print_exc()
+        
         # Verify weights actually changed
         weights_changed = False
         for layer_name in sample_layers:

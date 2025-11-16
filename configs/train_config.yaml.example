@@ -1,0 +1,153 @@
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+
+# Dataset paths
+data:
+  train_annotation: data/coco_train2017.txt
+  val_annotation: data/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+
+# Data loader configuration (for GPU optimization)
+data_loader:
+  use_tf_dataset: true          # Use tf.data.Dataset for better GPU utilization (recommended)
+  use_gpu_preprocessing: true    # Use GPU-accelerated preprocessing pipeline (recommended for A100)
+  prefetch_buffer: 6             # Prefetch buffer in batches (6 = good GPU-CPU overlap, 'auto' uses AUTOTUNE)
+  num_parallel_calls: 24         # Parallel calls for preprocessing (24 = aggressive, 'auto' uses AUTOTUNE)
+  shuffle_buffer_size: 8192      # Shuffle buffer size (larger = better randomization, default: 4096)
+  interleave_cycle_length: null  # Parallel file reading (null = auto-disable for frozen backbone, or set 8-16 for full training)
+  num_workers: 8                 # Number of CPU worker threads for data loading (legacy mode only)
+  cache_images: false            # Cache decoded images in memory (optional, uses more RAM)
+  
+# Training parameters
+training:
+  batch_size: 4
+  epochs: 100
+  initial_epoch: 0
+  
+  # Learning rate strategy:
+  # - For fine-tuning from pretrained weights (model5.h5): Use 0.0001 (1e-4) or 0.0005 (5e-4)
+  # - For training from scratch: Use 0.001 (1e-3)
+  # The optimizer section below will use this value
+  learning_rate: 0.0001  # Lower LR for fine-tuning (change to 0.001 for from-scratch training)
+  
+  # Two-stage training strategy
+  # When using pretrained weights (model5.h5):
+  #   - Option 1: freeze_level=1 (freeze backbone, train head only) for first few epochs, then unfreeze
+  #   - Option 2: freeze_level=0 (unfreeze all) with very low LR (1e-4)
+  # When training from scratch:
+  #   - Use freeze_level=0 (unfreeze all) or freeze_level=1 for first stage
+  transfer_epochs: 0      # Number of epochs to freeze backbone (0 = no freezing stage)
+  freeze_level: 1          # 0=unfreeze all, 1=freeze backbone only, 2=freeze all but head
+                           # For fine-tuning: start with 1, then change to 0 after transfer_epochs
+                           # For from-scratch: use 0 or 1
+  
+  # Loss configuration
+  loss_option: 2           # 1=IoL-MSE, 2=IoL-MSE+anchor (recommended), 3=GIoU/DIoU/CIoU
+  label_smoothing: 0.01    # Gentle label smoothing for regularization
+  elim_grid_sense: false
+  
+  # Loss scale parameters
+  # These control the relative importance of each loss component
+  # Adjust coord_scale if localization loss seems too low relative to other losses
+  loss:
+    coord_scale: 5.0       # Increased from 1.0 to balance with other losses (localization was too low)
+    object_scale: 1.0      # Scale for objectness loss (positive cells)
+    no_object_scale: 0.5   # Scale for objectness loss (negative cells) - lower to reduce negative cell dominance
+    class_scale: 1.0       # Scale for classification loss
+    anchor_scale: 1.0      # Scale for anchor prediction loss
+
+  # Loss normalization strategy
+  # Controls how loss values are normalized to ensure stable training and comparable metrics
+  # Options (can combine multiple, they multiply together):
+  #   - "batch": Normalize by batch size (default, recommended for consistent scaling)
+  #   - "positives": Normalize by number of positive cells (varies per batch, adapts to data)
+  #   - "grid": Normalize by batch_size * grid_h * grid_w (total grid cells)
+  # Examples:
+  #   ["batch"] - Default: normalize by batch size only (recommended)
+  #   ["positives"] - Normalize by number of objects (useful for imbalanced datasets)
+  #   ["batch", "grid"] - Normalize by both batch size and grid size
+  loss_normalization: ["batch"]  # Default: batch-size normalization
+
+  # Class weights for handling class imbalance
+  # Options:
+  #   - 'auto': Automatically compute from training data (recommended for imbalanced datasets)
+  #   - List of weights: [w0, w1, w2, ...] for each class
+  #   - null/omitted: Use equal weights (1.0 for all classes)
+  class_weights: null              # Disabled: use equal weights for all classes
+  class_weights_method: balanced    # Method for auto-computation: 'balanced', 'inverse', or 'sqrt_inverse'
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    enhance_type: mosaic   # 'mosaic' (YOLOv4 style), 'gridmask', or null
+    mosaic_prob: 0.3       # Probability for Mosaic augmentation (0.3 = moderate, good for fine-tuning)
+    mixup_prob: 0.1         # Probability for MixUp augmentation (0.1 = conservative, good for fine-tuning)
+    rescale_interval: -1   # Multi-scale training DISABLED (set to -1 to disable, or positive number for interval)
+    max_boxes_per_image: 100  # Fixed capacity for box tensors (prevents shape inconsistencies in batches)
+  
+  # Multi-anchor assignment
+  multi_anchor_assign: false
+
+# Optimizer configuration
+# Adam is simpler and well-understood (recommended for stability)
+# AdamW is newer with decoupled weight decay (can be better but more complex)
+optimizer:
+  type: adam              # Options: 'adam' (recommended, simpler), 'adamw', 'sgd'
+  learning_rate: 0.0001   # Will be overridden by training.learning_rate above
+                         # Fine-tuning: 0.0001 (1e-4) or 0.0005 (5e-4)
+                         # From scratch: 0.001 (1e-3)
+  beta_1: 0.9            # Momentum parameter (first moment decay)
+  beta_2: 0.999           # Momentum parameter (second moment decay)
+  epsilon: 1e-7          # Small constant for numerical stability
+  # AdamW-specific (only used if type: adamw)
+  weight_decay: 0.0005   # Weight decay for AdamW (decoupled from learning rate)
+  # SGD-specific (only used if type: sgd)
+  # momentum: 0.9
+  # nesterov: true
+
+# Learning rate schedule
+# Cosine annealing with warmup is modern and works well for both fine-tuning and from-scratch
+lr_schedule:
+  type: cosine_annealing   # Modern standard: Cosine annealing with warmup (recommended)
+  warmup_epochs: 3         # Number of epochs for warmup (gradual LR increase from low to initial_lr)
+  warmup_lr_factor: 0.01   # Start LR = initial_lr * warmup_lr_factor (1% of initial LR)
+  min_lr: 1.0e-7           # Minimum learning rate at end of cosine decay
+  
+  # Alternative: Reduce on plateau (reactive, reduces LR when validation loss plateaus)
+  # Uncomment below and comment out cosine_annealing if preferred:
+  # type: reduce_on_plateau
+  # factor: 0.5            # Multiply LR by this factor when reducing
+  # patience: 3             # Number of epochs to wait before reducing LR
+  # min_lr: 1.0e-7         # Minimum learning rate
+
+# Callbacks
+callbacks:
+  checkpoint:
+    save_best_only: true
+    monitor: val_loss      # Monitor validation loss for best model
+    save_dir: logs/checkpoints
+  tensorboard:
+    log_dir: logs/tensorboard
+  early_stopping:
+    monitor: val_loss
+    patience: 10           # Stop training if val_loss doesn't improve for 10 epochs
+    
+# Resume training
+# Set enabled: true and provide weights_path to continue from checkpoint
+resume:
+  enabled: false
+  weights_path: null          # Path to pretrained full model weights (e.g., weights/model5.h5)
+  backbone_weights_path: null  # Path to pretrained backbone weights (e.g., weights/darknet53.h5)
+  
+  # Training strategy when using pretrained weights:
+  # 1. Set weights_path: weights/model5.h5
+  # 2. Set training.learning_rate: 0.0001 (lower for fine-tuning)
+  # 3. Set training.freeze_level: 1 (freeze backbone first)
+  # 4. Train for 10-20 epochs with frozen backbone
+  # 5. Then set freeze_level: 0 and continue training
+  
+# Output
+output:
+  log_dir: logs/training
+  model_dir: trained_models
+  save_frequency: 1  # Save every N epochs

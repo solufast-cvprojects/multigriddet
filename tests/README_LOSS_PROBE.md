@@ -2,7 +2,9 @@
 
 ## Purpose
 
-This diagnostic tool probes individual loss components (localization, objectness, anchor, classification) during training to diagnose validation loss divergence. It helps identify which loss component is causing instability, especially useful when validation loss diverges after the first epoch.
+This diagnostic tool probes individual loss components (localization, objectness, anchor, classification) during training to diagnose validation loss divergence and identify training instability issues. It helps identify which loss component is causing problems, especially useful when validation loss diverges after the first epoch or when fine-tuning pretrained models.
+
+The tool computes loss components using the exact same infrastructure as training, ensuring diagnostic results match what the model sees during actual training.
 
 ## Prerequisites
 
@@ -12,6 +14,8 @@ This diagnostic tool probes individual loss components (localization, objectness
    ```
 
 2. **Configuration**: Ensure `configs/train_config.yaml` exists and is properly configured, or specify a custom config file.
+
+3. **Weights (Optional)**: If testing with pretrained weights, ensure the weights file exists at the specified path.
 
 ## Usage
 
@@ -24,9 +28,9 @@ python tests/probe_multigrid_loss.py --num-batches 2
 This will:
 - Load the training config from `configs/train_config.yaml`
 - Build the training model with the same configuration as actual training
-- Create a MultiGridDataGenerator using the real augmentation pipeline
-- Process 2 batches and log all loss components
-- Save results to `tests/loss_probe_outputs/`
+- Create a `MultiGridDataGenerator` using the real augmentation pipeline
+- Process 2 batches and log all loss components before any weight updates
+- Save results to `tests/loss_probe_outputs/` in both JSON and CSV formats
 
 ### Command-Line Arguments
 
@@ -77,7 +81,7 @@ python tests/probe_multigrid_loss.py --num-batches 2 --output-dir loss_random/
 python tests/probe_multigrid_loss.py --weights weights/model.h5 --num-batches 2 --output-dir loss_pretrained/
 ```
 
-## Output Interpretation
+## Output Format
 
 ### Console Output
 
@@ -112,6 +116,8 @@ The script prints detailed information for each batch:
    - Normalization factors for each component
 
 ### File Outputs
+
+Results are saved to the specified output directory (default: `tests/loss_probe_outputs/`):
 
 #### JSON Format (`loss_components.json`)
 
@@ -149,6 +155,8 @@ Tabular format for easy analysis:
 | 0         | 4          | 12            | 2.345      | 0.123            | 1.456          | 0.234       | 0.532              | 1.0         | 1.0          | ... |
 
 ## Understanding Loss Components
+
+Each loss component measures a different aspect of the detection task. Understanding their normal ranges and what high values indicate helps diagnose training issues.
 
 ### Localization Loss
 
@@ -190,7 +198,17 @@ Tabular format for easy analysis:
   - Poor feature representation
   - Incorrect class weights
 
-## Identifying Imbalance
+## What to Look For
+
+### Loss Component Balance
+
+A well-balanced loss typically has:
+- **Objectness loss**: Highest component (due to many negative cells)
+- **Classification loss**: Second highest (depends on number of classes)
+- **Anchor loss**: Moderate (only computed on object cells)
+- **Localization loss**: Lowest (typically well-behaved)
+
+If one component dominates (e.g., 5-10x higher than others), it may indicate an issue.
 
 ### Objectness Dominating
 
@@ -232,14 +250,14 @@ If normalization factors vary significantly between batches, it may indicate:
 
 ## Troubleshooting
 
-### Error: "Could not extract base model from training model"
+### Warning: "Could not extract base model: Base model not found as sub-layer"
 
-**Cause**: The training model structure may have changed or is incompatible.
+**Cause**: This is a cosmetic warning in the diagnostic script's internal logic. The training model structure is correct, and weights are shared as intended.
 
 **Solution**: 
-- Check that you're using the correct version of the codebase
-- Verify the model was built correctly
-- Try running with a fresh model build
+- This warning can be safely ignored
+- The diagnostic tool will use a fallback method to extract predictions
+- Training model functionality is not affected
 
 ### Error: "Config file not found"
 
@@ -281,20 +299,42 @@ If normalization factors vary significantly between batches, it may indicate:
 ## Best Practices
 
 1. **Run before training**: Use this tool to verify loss components are reasonable before starting full training
-2. **Compare across epochs**: Save outputs and compare loss component trends across training epochs
-3. **Monitor objectness**: Objectness loss is often the culprit for validation divergence - monitor it closely
-4. **Check normalization**: Ensure normalization factors are reasonable and consistent
-5. **Use verbose mode**: Enable `--verbose` to see per-scale breakdowns for detailed analysis
+2. **Compare initialization strategies**: Test with random initialization vs pretrained weights to verify weight loading
+3. **Compare across epochs**: Save outputs and compare loss component trends across training epochs
+4. **Monitor objectness**: Objectness loss is often the culprit for validation divergence - monitor it closely
+5. **Check normalization**: Ensure normalization factors are reasonable and consistent
+6. **Use verbose mode**: Enable `--verbose` to see per-scale breakdowns for detailed analysis
+7. **Save outputs**: Keep JSON/CSV outputs for comparison and analysis
+
+## Technical Details
+
+### Model Building
+
+The diagnostic tool uses the same model building infrastructure as training:
+- Same config loading (`ConfigLoader`)
+- Same model building (`MultiGridTrainer.build_model()`)
+- Same weight loading mechanism (including batch normalization statistics)
+- Same loss function configuration
+
+### Data Pipeline
+
+The tool uses the exact same data pipeline as training:
+- Same data generator (`MultiGridDataGenerator` with real augmentation pipeline)
+- Same augmentation sequence and parameters
+- Same batch preparation and padding
+- Same target encoding (`y_true` format)
+
+### Loss Computation
+
+Loss components are computed using the actual `MultiGridLoss` class:
+- Same loss computation logic as training
+- Same normalization factors
+- Same scaling coefficients
+- Computed before any weight updates (pure forward pass)
 
 ## Integration with Training
 
-This diagnostic tool uses the exact same infrastructure as training:
-- Same config loading (`ConfigLoader`)
-- Same model building (`MultiGridTrainer.build_model()`)
-- Same data generator (`MultiGridDataGenerator` with real augmentation pipeline)
-- Same loss function configuration
-
-This ensures the diagnostic results match what the model sees during actual training.
+This diagnostic tool uses the exact same infrastructure as training, ensuring diagnostic results match what the model sees during actual training. The only difference is that no weight updates are performed - it's a pure diagnostic forward pass.
 
 ## Example Workflow
 
