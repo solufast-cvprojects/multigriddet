@@ -1813,12 +1813,39 @@ class MultiGridDataGenerator(Sequence):
                 scaled_w = tf.cast(src_w * scale_w, tf.int32)
                 image_scaled = tf.image.resize(image, [scaled_h, scaled_w], method='bicubic')
                 # Then letterbox to final input_shape
-                image_resized = tf_letterbox_resize(image_scaled, self.input_shape, return_padding_info=False)
-                # Scale boxes accordingly (only scale, letterbox doesn't change box coordinates if done correctly)
-                boxes = boxes * tf.stack([scale_w, scale_h, scale_w, scale_h, 1.0])
+                # CRITICAL: Get padding info to transform boxes correctly
+                image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
+                    image_scaled, self.input_shape, return_padding_info=True
+                )
+                # Transform boxes: first apply multi-scale scaling, then letterbox scale and padding offset
+                letterbox_scale = tf.minimum(
+                    tf.cast(new_w, tf.float32) / tf.cast(scaled_w, tf.float32),
+                    tf.cast(new_h, tf.float32) / tf.cast(scaled_h, tf.float32)
+                )
+                boxes = boxes * tf.stack([scale_w * letterbox_scale, scale_h * letterbox_scale, 
+                                         scale_w * letterbox_scale, scale_h * letterbox_scale, 1.0])
+                pad_left_f = tf.cast(pad_left, tf.float32)
+                pad_top_f = tf.cast(pad_top, tf.float32)
+                boxes = boxes + tf.stack([pad_left_f, pad_top_f, pad_left_f, pad_top_f, 0.0])
             else:
                 # No multi-scale: just letterbox resize
-                image_resized = tf_letterbox_resize(image, self.input_shape, return_padding_info=False)
+                # CRITICAL: Get padding info to transform boxes correctly
+                # Boxes are in original image coordinates and need to be scaled and offset
+                image_shape = tf.shape(image)
+                src_h = tf.cast(image_shape[0], tf.float32)
+                src_w = tf.cast(image_shape[1], tf.float32)
+                image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
+                    image, self.input_shape, return_padding_info=True
+                )
+                # Transform boxes: scale first, then add padding offset
+                scale = tf.minimum(
+                    tf.cast(new_w, tf.float32) / src_w,
+                    tf.cast(new_h, tf.float32) / src_h
+                )
+                pad_left_f = tf.cast(pad_left, tf.float32)
+                pad_top_f = tf.cast(pad_top, tf.float32)
+                boxes = boxes * tf.stack([scale, scale, scale, scale, 1.0])
+                boxes = boxes + tf.stack([pad_left_f, pad_top_f, pad_left_f, pad_top_f, 0.0])
             
             # Apply augmentations if enabled
             if self.augment:
