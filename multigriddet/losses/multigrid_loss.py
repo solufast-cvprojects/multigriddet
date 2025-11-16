@@ -764,15 +764,15 @@ class MultiGridLoss:
                                 object_mask: tf.Tensor, ignore_mask: Optional[tf.Tensor],
                                 norm_factor: tf.Tensor) -> tf.Tensor:
         """
-        Compute objectness loss using sigmoid BCE.
+        Compute objectness loss using BCE with logits.
         
         Objectness predicts if an object exists in a grid cell.
         
         Formula:
         L_objectness = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale] 
-                       * BCE(true_obj, sigmoid(pred_obj)) / total_grid_cells
+                       * BCE(true_obj, pred_obj, from_logits=True) / normalization
         
-        Normalized by total_grid_cells for stability (objectness applies to all cells, not just objects).
+        Uses from_logits=True for numerical stability (BCE handles sigmoid internally).
         
         This includes:
         - Positive cells (object_mask > 0): weighted by object_scale
@@ -782,11 +782,9 @@ class MultiGridLoss:
         if ignore_mask is None:
             ignore_mask = tf.zeros_like(object_mask)
         
-        # Apply sigmoid to pred_obj (raw logits -> probabilities)
-        pred_obj_sigmoid = tf.nn.sigmoid(pred_obj)  # [batch, grid_h, grid_w, 1]
-        
-        # BCE loss on objectness predictions (from_logits=False since we already applied sigmoid)
-        objectness_loss = K.binary_crossentropy(true_obj, pred_obj_sigmoid, from_logits=False)
+        # BCE loss on objectness predictions (from_logits=True - feed logits directly to BCE)
+        # This is more numerically stable than manually applying sigmoid first
+        objectness_loss = K.binary_crossentropy(true_obj, pred_obj, from_logits=True)
         
         # Weight mask: positive cells get object_scale, negative cells get no_object_scale
         # Ignore cells (ignore_mask > 0) are excluded (weight = 0)
