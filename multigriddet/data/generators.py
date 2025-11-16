@@ -512,14 +512,21 @@ def tf_random_mosaic(images: tf.Tensor,
     |  1  | 2 |
     -----------
     
+    CRITICAL: This function preserves ALL boxes from the 4 source images.
+    Box capacity must be expanded to 4× before calling this function to prevent truncation.
+    The old implementation silently truncated boxes to single-image max_boxes, discarding
+    up to 75% of objects per composite and corrupting supervision signals.
+    
     Args:
         images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
         boxes: Batch of boxes tensor of shape (batch_size, max_boxes, 5) in format (x1, y1, x2, y2, class)
+               NOTE: max_boxes should be 4× the single-image capacity to accommodate all merged boxes
         prob: Probability of applying Mosaic (default: 1.0 for high impact)
         min_offset: Minimum offset ratio for crop position (0.2 = 20% from edges)
         
     Returns:
-        Tuple of (augmented_images, merged_boxes)
+        Tuple of (augmented_images, merged_boxes) where merged_boxes contains all valid boxes
+        from the 4 source images (padded to max_boxes, never truncated)
     """
     batch_size = tf.shape(images)[0]
     image_shape = tf.shape(images)
@@ -580,6 +587,8 @@ def tf_random_mosaic(images: tf.Tensor,
             
             # Merge boxes from all 4 images
             # Box format: (x1, y1, x2, y2, class)
+            # CRITICAL: max_boxes_per_image is already expanded to 4× capacity before this function
+            # We preserve ALL valid boxes - no truncation allowed
             max_boxes_per_image = tf.shape(boxes)[1]
             
             def merge_boxes_for_quadrant(boxes_quad, quadrant_idx, crop_x_f, crop_y_f, width, height):
@@ -657,19 +666,31 @@ def tf_random_mosaic(images: tf.Tensor,
                 all_boxes.append(valid_boxes)
             
             # Concatenate all valid boxes
+            # CRITICAL: Never truncate - preserve all boxes from 4 source images
+            # Capacity was expanded to 4× before calling this function
             if len(all_boxes) > 0:
                 merged_boxes = tf.concat(all_boxes, axis=0)
             else:
                 # No valid boxes, create empty box
                 merged_boxes = tf.zeros([0, 5], dtype=tf.float32)
             
-            # Pad or truncate to max_boxes_per_image
+            # Pad to max_boxes_per_image (capacity already expanded to 4×)
+            # NEVER truncate - this would silently drop detections and corrupt supervision
             num_boxes = tf.shape(merged_boxes)[0]
-            if num_boxes > max_boxes_per_image:
-                merged_boxes = merged_boxes[:max_boxes_per_image]
-            elif num_boxes < max_boxes_per_image:
-                padding = tf.zeros([max_boxes_per_image - num_boxes, 5], dtype=tf.float32)
-                merged_boxes = tf.concat([merged_boxes, padding], axis=0)
+            padding_needed = max_boxes_per_image - num_boxes
+            
+            def pad_boxes():
+                padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
+                return tf.concat([merged_boxes, padding], axis=0)
+            
+            def no_pad():
+                return merged_boxes
+            
+            merged_boxes = tf.cond(
+                padding_needed > 0,
+                pad_boxes,
+                no_pad
+            )
             
             # Expand to batch dimension (we're processing one mosaic per batch item)
             merged_image = tf.expand_dims(merged_image, 0)  # (1, H, W, 3)
@@ -730,6 +751,8 @@ def tf_random_mosaic(images: tf.Tensor,
                 merged_img = tf.concat([area_left, area_right], axis=1)
                 
                 # Merge boxes from all 4 quadrants with proper coordinate shifting
+                # CRITICAL: max_boxes_per_image is already expanded to 4× capacity before this function
+                # We preserve ALL valid boxes - no truncation allowed
                 max_boxes_per_image = tf.shape(boxes)[1]
                 
                 def merge_boxes_for_quadrant(boxes_quad, quadrant_idx, crop_x_f, crop_y_f, width, height):
@@ -761,7 +784,8 @@ def tf_random_mosaic(images: tf.Tensor,
                         keep = tf.logical_and(tf.logical_and(y2 > 0.0, y1 < crop_y_f), 
                                             tf.logical_and(x2 > 0.0, x1 < crop_x_f))
                         keep = tf.logical_and(keep, valid_mask)
-                        # Clip to crop boundaries (no shift needed - already at origin)
+                        # No shift needed - quadrant is at origin
+                        # Clip to crop boundaries
                         x1_new = tf.maximum(x1, 0.0)
                         y1_new = tf.maximum(y1, 0.0)
                         x2_new = tf.minimum(x2, crop_x_f)
@@ -772,9 +796,12 @@ def tf_random_mosaic(images: tf.Tensor,
                         keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, y1 < height), 
                                             tf.logical_and(x2 > 0.0, x1 < crop_x_f))
                         keep = tf.logical_and(keep, valid_mask)
-                        # Clip to crop boundaries (coordinates already match - no shift needed)
+                        # Transform coordinates: 
+                        # The crop img1[crop_y:, :crop_x] is placed at (0, crop_y) in final image
+                        # Boxes in original image at (x, y) where y >= crop_y become (x, y) in final image
+                        # No shift needed - boxes stay at same absolute position
                         x1_new = tf.maximum(x1, 0.0)
-                        y1_new = tf.maximum(y1, crop_y_f)  # Clip y_min to crop_y
+                        y1_new = tf.maximum(y1, crop_y_f)  # Keep y as-is, just clip
                         x2_new = tf.minimum(x2, crop_x_f)
                         y2_new = tf.minimum(y2, height)
                         
@@ -783,9 +810,12 @@ def tf_random_mosaic(images: tf.Tensor,
                         keep = tf.logical_and(tf.logical_and(y2 > crop_y_f, y1 < height), 
                                             tf.logical_and(x2 > crop_x_f, x1 < width))
                         keep = tf.logical_and(keep, valid_mask)
-                        # Clip to crop boundaries (coordinates already match - no shift needed)
-                        x1_new = tf.maximum(x1, crop_x_f)  # Clip x_min to crop_x
-                        y1_new = tf.maximum(y1, crop_y_f)  # Clip y_min to crop_y
+                        # Transform coordinates:
+                        # The crop img2[crop_y:, crop_x:] is placed at (crop_x, crop_y) in final image
+                        # Boxes in original image at (x, y) where x >= crop_x and y >= crop_y 
+                        # stay at (x, y) in final image - no shift needed
+                        x1_new = tf.maximum(x1, crop_x_f)  # Keep x as-is, just clip
+                        y1_new = tf.maximum(y1, crop_y_f)  # Keep y as-is, just clip
                         x2_new = tf.minimum(x2, width)
                         y2_new = tf.minimum(y2, height)
                         
@@ -794,8 +824,11 @@ def tf_random_mosaic(images: tf.Tensor,
                         keep = tf.logical_and(tf.logical_and(y2 > 0.0, y1 < crop_y_f), 
                                             tf.logical_and(x2 > crop_x_f, x1 < width))
                         keep = tf.logical_and(keep, valid_mask)
-                        # Clip to crop boundaries (coordinates already match - no shift needed)
-                        x1_new = tf.maximum(x1, crop_x_f)  # Clip x_min to crop_x
+                        # Transform coordinates:
+                        # The crop img3[:crop_y, crop_x:] is placed at (crop_x, 0) in final image
+                        # Boxes in original image at (x, y) where x >= crop_x and y < crop_y
+                        # stay at (x, y) in final image - no shift needed
+                        x1_new = tf.maximum(x1, crop_x_f)  # Keep x as-is, just clip
                         y1_new = tf.maximum(y1, 0.0)
                         x2_new = tf.minimum(x2, width)
                         y2_new = tf.minimum(y2, crop_y_f)
@@ -826,19 +859,31 @@ def tf_random_mosaic(images: tf.Tensor,
                     all_boxes.append(valid_boxes)
                 
                 # Concatenate all valid boxes
+                # CRITICAL: Never truncate - preserve all boxes from 4 source images
+                # Capacity was expanded to 4× before calling this function
                 if len(all_boxes) > 0:
                     merged_boxes = tf.concat(all_boxes, axis=0)
                 else:
                     # No valid boxes, create empty box
                     merged_boxes = tf.zeros([0, 5], dtype=tf.float32)
                 
-                # Pad or truncate to max_boxes_per_image
+                # Pad to max_boxes_per_image (capacity already expanded to 4×)
+                # NEVER truncate - this would silently drop detections and corrupt supervision
                 num_boxes = tf.shape(merged_boxes)[0]
-                if num_boxes > max_boxes_per_image:
-                    merged_boxes = merged_boxes[:max_boxes_per_image]
-                elif num_boxes < max_boxes_per_image:
-                    padding = tf.zeros([max_boxes_per_image - num_boxes, 5], dtype=tf.float32)
-                    merged_boxes = tf.concat([merged_boxes, padding], axis=0)
+                padding_needed = max_boxes_per_image - num_boxes
+                
+                def pad_boxes():
+                    padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
+                    return tf.concat([merged_boxes, padding], axis=0)
+                
+                def no_pad():
+                    return merged_boxes
+                
+                merged_boxes = tf.cond(
+                    padding_needed > 0,
+                    pad_boxes,
+                    no_pad
+                )
                 
                 return merged_img, merged_boxes
             
@@ -885,14 +930,21 @@ def tf_random_mixup(images: tf.Tensor,
     - mixed_image = lambda * image1 + (1 - lambda) * image2
     - mixed_boxes = concatenate(boxes1, boxes2)
     
+    CRITICAL: This function preserves ALL boxes from both source images.
+    Box capacity must be expanded to 2× before calling this function to prevent truncation.
+    The old implementation silently truncated boxes to single-image max_boxes, discarding
+    up to 50% of objects per composite and corrupting supervision signals.
+    
     Args:
         images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
         boxes: Batch of boxes tensor of shape (batch_size, max_boxes, 5) in format (x1, y1, x2, y2, class)
+               NOTE: max_boxes should be 2× the single-image capacity to accommodate all merged boxes
         prob: Probability of applying MixUp (default: 0.15 to avoid over-augmentation)
         alpha: Beta distribution parameter for mixing ratio (default: 0.2, typical range: 0.1-0.4)
         
     Returns:
-        Tuple of (mixed_images, mixed_boxes)
+        Tuple of (mixed_images, mixed_boxes) where mixed_boxes contains all valid boxes
+        from both source images (padded to max_boxes, never truncated)
     """
     batch_size = tf.shape(images)[0]
     should_apply = tf.random.uniform([]) < prob
@@ -942,7 +994,9 @@ def tf_random_mixup(images: tf.Tensor,
             valid_boxes1 = tf.boolean_mask(boxes1, valid_mask1)
             valid_boxes2 = tf.boolean_mask(boxes2, valid_mask2)
             
-            # Concatenate valid boxes
+            # Concatenate valid boxes from both images
+            # CRITICAL: Never truncate - preserve all boxes from both source images
+            # Capacity was expanded to 2× before calling this function
             if tf.shape(valid_boxes1)[0] > 0 and tf.shape(valid_boxes2)[0] > 0:
                 mixed_boxes = tf.concat([valid_boxes1, valid_boxes2], axis=0)
             elif tf.shape(valid_boxes1)[0] > 0:
@@ -953,15 +1007,24 @@ def tf_random_mixup(images: tf.Tensor,
                 # No valid boxes, return empty
                 mixed_boxes = tf.zeros([0, 5], dtype=tf.float32)
             
-            # Pad or truncate to max_boxes
+            # Pad to max_boxes (capacity already expanded to 2×)
+            # NEVER truncate - this would silently drop detections and corrupt supervision
             max_boxes = tf.shape(boxes)[1]
             num_boxes = tf.shape(mixed_boxes)[0]
+            padding_needed = max_boxes - num_boxes
             
-            if num_boxes > max_boxes:
-                mixed_boxes = mixed_boxes[:max_boxes]
-            elif num_boxes < max_boxes:
-                padding = tf.zeros([max_boxes - num_boxes, 5], dtype=tf.float32)
-                mixed_boxes = tf.concat([mixed_boxes, padding], axis=0)
+            def pad_boxes():
+                padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
+                return tf.concat([mixed_boxes, padding], axis=0)
+            
+            def no_pad():
+                return mixed_boxes
+            
+            mixed_boxes = tf.cond(
+                padding_needed > 0,
+                pad_boxes,
+                no_pad
+            )
             
             return mixed_img, mixed_boxes
         
@@ -1212,6 +1275,8 @@ class MultiGridDataGenerator(Sequence):
                  shuffle: bool = True,
                  prefetch_factor: int = 2,
                  num_workers: int = 8,
+                 mosaic_prob: float = 0.3,
+                 mixup_prob: float = 0.1,
                  **kwargs):
         """
         Initialize the optimized data generator.
@@ -1229,6 +1294,8 @@ class MultiGridDataGenerator(Sequence):
             shuffle: Whether to shuffle data
             prefetch_factor: Prefetch factor for data loading
             num_workers: Number of worker threads
+            mosaic_prob: Probability of applying Mosaic augmentation (default: 0.3, suitable for fine-tuning)
+            mixup_prob: Probability of applying MixUp augmentation (default: 0.1, suitable for fine-tuning)
         """
         # Call parent class constructor for Keras 3.0 compatibility
         super().__init__(**kwargs)
@@ -1244,6 +1311,8 @@ class MultiGridDataGenerator(Sequence):
         self.shuffle = shuffle
         self.prefetch_factor = prefetch_factor
         self.num_workers = num_workers
+        self.mosaic_prob = mosaic_prob
+        self.mixup_prob = mixup_prob
         
         # Initialize indexes
         self.indexes = np.arange(len(self.annotation_lines))
@@ -1559,21 +1628,69 @@ class MultiGridDataGenerator(Sequence):
             drop_remainder=False
         )
         
+        # Expand box capacity before batch augmentations to prevent truncation
+        # CRITICAL: Mosaic combines 4 images, MixUp combines 2 images
+        # Without capacity expansion, boxes are truncated to single-image max_boxes,
+        # silently dropping up to 75% of objects per composite and corrupting supervision
+        if self.augment:
+            def _expand_box_capacity(images, boxes_dense):
+                """
+                Expand box capacity to accommodate composite images from batch augmentations.
+                
+                This prevents silent truncation that corrupts supervision:
+                - Mosaic merges 4 images, so needs 4× capacity
+                - MixUp merges 2 images, so needs 2× capacity
+                - If both enabled, use 4× (max of both)
+                
+                Old implementation truncated to single-image max_boxes, discarding
+                up to 75% of objects per composite and causing val_loss to diverge.
+                """
+                current_max_boxes = tf.shape(boxes_dense)[1]
+                
+                # Determine expansion factor based on enabled augmentations
+                # Mosaic needs 4× capacity (merges 4 images), MixUp needs 2× (merges 2 images)
+                # If both enabled, use 4× (max of both)
+                # Always expand if augmentations are enabled to be safe
+                if self.enhance_augment == 'mosaic':
+                    expansion_factor = 4  # Mosaic merges 4 images
+                else:
+                    expansion_factor = 2  # MixUp merges 2 images (or no batch aug, but safe to expand)
+                
+                target_max_boxes = current_max_boxes * expansion_factor
+                
+                # Pad boxes to expanded capacity
+                batch_size = tf.shape(boxes_dense)[0]
+                padding_needed = target_max_boxes - current_max_boxes
+                
+                # Always pad (padding_needed should be positive if expansion_factor > 1)
+                if padding_needed > 0:
+                    padding = tf.zeros([batch_size, padding_needed, 5], dtype=tf.float32)
+                    boxes_expanded = tf.concat([boxes_dense, padding], axis=1)
+                else:
+                    boxes_expanded = boxes_dense
+                
+                return images, boxes_expanded
+            
+            dataset = dataset.map(_expand_box_capacity, num_parallel_calls=num_parallel_calls)
+        
         # Apply batch-level augmentations (Mosaic, MixUp) if enabled
         if self.augment:
+            # Get probabilities from config (with defaults for backward compatibility)
+            mosaic_prob = getattr(self, 'mosaic_prob', 0.3)
+            mixup_prob = getattr(self, 'mixup_prob', 0.1)
+            
             def _apply_batch_augmentations(images, boxes_dense):
                 """Apply batch-level augmentations (Mosaic, MixUp)."""
                 # Apply Mosaic if enabled
-                # High probability (0.9 = 90%) as it's highly effective for object detection
+                # Conservative default probability (0.3) suitable for fine-tuning
                 # Mosaic combines 4 images, increasing effective batch size and context diversity
                 if self.enhance_augment == 'mosaic':
-                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=0.9)
+                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=mosaic_prob)
                 
-                # Apply MixUp with reduced probability to prevent over-augmentation
+                # Apply MixUp with conservative probability to prevent over-augmentation
                 # MixUp blends two images, which can make objects hard to distinguish
-                # Reduced from 0.15 to 0.05 (5%) to maintain data quality while still providing
-                # regularization benefits. MixUp can be combined with Mosaic or used alone.
-                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=0.05, alpha=0.2)
+                # Conservative default (0.1) maintains data quality while providing regularization
+                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=mixup_prob, alpha=0.2)
                 
                 return images, boxes_dense
             

@@ -177,7 +177,9 @@ class MultiGridTrainer:
             rescale_interval=augment_config.get('rescale_interval', -1),
             multi_anchor_assign=training_config.get('multi_anchor_assign', False),
             shuffle=True,
-            num_workers=num_workers
+            num_workers=num_workers,
+            mosaic_prob=augment_config.get('mosaic_prob', 0.3),
+            mixup_prob=augment_config.get('mixup_prob', 0.1)
         )
         
         # Create validation generator
