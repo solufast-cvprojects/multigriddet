@@ -666,33 +666,34 @@ class MultiGridLoss:
         """
         Compute anchor prediction loss using BCE.
         
-        Formula (Option 2 with background examples):
-        L_anchor = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale] 
-                   * BCE(true_anchors, pred_anchors) / normalization
+        CRITICAL FIX: Anchor loss is now computed ONLY on object cells (like classification loss).
+        Anchor prediction answers "which anchor fits this object best", so it should only
+        be computed where objects exist. Computing on negative cells was causing the loss
+        to be dominated by negative cells (85%+ contribution), making it 6-8x larger than
+        it should be.
+        
+        Formula (Fixed):
+        L_anchor = Σ object_mask * object_scale * BCE(true_anchors, pred_anchors) / normalization
         
         This includes:
         - Positive cells (object_mask > 0): weighted by object_scale
-        - Negative cells (object_mask == 0 and ignore_mask == 0): weighted by no_object_scale
+        - Negative cells: EXCLUDED (anchor prediction doesn't apply to background)
         - Ignore cells (ignore_mask > 0): excluded from loss
         """
         if ignore_mask is None:
             ignore_mask = tf.zeros_like(object_mask)
         
-        # Create true anchors for negative cells (all zeros to push predictions toward 0)
-        # true_anchors already has zeros for negative cells, so we can use it directly
-        
         # BCE loss on anchor predictions
         anchor_loss = K.binary_crossentropy(true_anchors, pred_anchors, from_logits=True)
         
-        # Weight mask: positive cells get object_scale, negative cells get no_object_scale
-        # Ignore cells (ignore_mask > 0) are excluded (weight = 0)
-        positive_weight = object_mask * self.object_scale  # [batch, grid_h, grid_w, 1]
-        negative_mask = (1.0 - object_mask) * (1.0 - ignore_mask)  # [batch, grid_h, grid_w, 1]
-        negative_weight = negative_mask * self.no_object_scale  # [batch, grid_h, grid_w, 1]
-        combined_weight = positive_weight + negative_weight  # [batch, grid_h, grid_w, 1]
+        # Apply object mask: ONLY compute anchor loss on object cells
+        # Anchor prediction is about "which anchor fits this object best", so it only
+        # makes sense for cells that contain objects
+        # Broadcasting: [batch, grid_h, grid_w, 1] × [batch, grid_h, grid_w, num_anchors]
+        anchor_loss = anchor_loss * object_mask * self.object_scale
         
-        # Apply weight mask: shape broadcasting [batch, grid_h, grid_w, 1] × [batch, grid_h, grid_w, num_anchors]
-        anchor_loss = anchor_loss * combined_weight
+        # Exclude ignore cells (if any)
+        anchor_loss = anchor_loss * (1.0 - ignore_mask)
         
         # Normalize by norm_factor (passed as parameter for consistency)
         anchor_loss_sum = K.sum(anchor_loss)
