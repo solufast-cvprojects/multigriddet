@@ -98,7 +98,7 @@ optimizer:
                          # From scratch: 0.001 (1e-3)
   beta_1: 0.9            # Momentum parameter (first moment decay)
   beta_2: 0.999           # Momentum parameter (second moment decay)
-  epsilon: 1e-7          # Small constant for numerical stability
+  epsilon: 1.0e-7        # Small constant for numerical stability (must be 1.0e-7, not 1e-7 for YAML parsing)
   # AdamW-specific (only used if type: adamw)
   weight_decay: 0.0005   # Weight decay for AdamW (decoupled from learning rate)
   # SGD-specific (only used if type: sgd)
