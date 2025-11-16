@@ -67,6 +67,8 @@ training:
   augmentation:
     enabled: true
     enhance_type: mosaic   # 'mosaic' (YOLOv4 style), 'gridmask', or null
+    mosaic_prob: 0.3       # Probability for Mosaic augmentation (default: 0.3, suitable for fine-tuning)
+    mixup_prob: 0.1         # Probability for MixUp augmentation (default: 0.1, suitable for fine-tuning)
     rescale_interval: -1   # Multi-scale training DISABLED (set to -1 to disable)
   
   # Multi-anchor assignment
