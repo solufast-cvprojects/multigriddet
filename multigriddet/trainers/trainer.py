@@ -179,7 +179,8 @@ class MultiGridTrainer:
             shuffle=True,
             num_workers=num_workers,
             mosaic_prob=augment_config.get('mosaic_prob', 0.3),
-            mixup_prob=augment_config.get('mixup_prob', 0.1)
+            mixup_prob=augment_config.get('mixup_prob', 0.1),
+            max_boxes_per_image=augment_config.get('max_boxes_per_image', 100)
         )
         
         # Create validation generator

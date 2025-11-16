@@ -70,6 +70,7 @@ training:
     mosaic_prob: 0.3       # Probability for Mosaic augmentation (default: 0.3, suitable for fine-tuning)
     mixup_prob: 0.1         # Probability for MixUp augmentation (default: 0.1, suitable for fine-tuning)
     rescale_interval: -1   # Multi-scale training DISABLED (set to -1 to disable)
+    max_boxes_per_image: 100  # Fixed capacity for box tensors (prevents shape inconsistencies in batches)
   
   # Multi-anchor assignment
   multi_anchor_assign: false

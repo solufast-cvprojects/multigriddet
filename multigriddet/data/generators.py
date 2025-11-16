@@ -513,9 +513,16 @@ def tf_random_mosaic(images: tf.Tensor,
     -----------
     
     CRITICAL: This function preserves ALL boxes from the 4 source images.
-    Box capacity must be expanded to 4× before calling this function to prevent truncation.
-    The old implementation silently truncated boxes to single-image max_boxes, discarding
-    up to 75% of objects per composite and corrupting supervision signals.
+    Box capacity must be expanded to 4× (or 8× if MixUp is also enabled) before calling 
+    this function to prevent truncation. The old implementation silently truncated boxes 
+    to single-image max_boxes, discarding up to 75% of objects per composite and 
+    corrupting supervision signals, causing val_loss to diverge during fine-tuning and 
+    "untraining" pretrained weights.
+    
+    Fixed-capacity padding ensures every batch has consistent tensor shapes, preventing
+    shape inconsistencies that corrupt training. Explicit capacity expansion (4× for Mosaic,
+    2× for MixUp, 8× for both) ensures no ground-truth boxes are lost unless physically
+    cropped out of the image bounds.
     
     Args:
         images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
@@ -676,20 +683,29 @@ def tf_random_mosaic(images: tf.Tensor,
             
             # Pad to max_boxes_per_image (capacity already expanded to 4×)
             # NEVER truncate - this would silently drop detections and corrupt supervision
+            # If capacity is exceeded, this indicates insufficient expansion and should be fixed
             num_boxes = tf.shape(merged_boxes)[0]
             padding_needed = max_boxes_per_image - num_boxes
             
-            def pad_boxes():
-                padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
-                return tf.concat([merged_boxes, padding], axis=0)
+            # Check for overflow and raise error if it occurs
+            # Use tf.Assert to check at runtime (not during graph tracing)
+            overflow_condition = num_boxes > max_boxes_per_image
+            tf.debugging.assert_equal(
+                overflow_condition,
+                False,
+                message="Mosaic augmentation: Box capacity overflow. "
+                        "Merged boxes exceed configured capacity. "
+                        "This indicates insufficient capacity expansion. "
+                        "Remedies: (1) Increase max_boxes_per_image in config, "
+                        "(2) Reduce mosaic_prob or mixup_prob to lower expansion factor, "
+                        "or (3) Check that expansion factor calculation is correct (expected: 4× for Mosaic-only, 8× for Mosaic+MixUp)."
+            )
             
-            def no_pad():
-                return merged_boxes
-            
+            # Pad if needed, otherwise return as-is
             merged_boxes = tf.cond(
                 padding_needed > 0,
-                pad_boxes,
-                no_pad
+                lambda: tf.concat([merged_boxes, tf.zeros([padding_needed, 5], dtype=tf.float32)], axis=0),
+                lambda: merged_boxes
             )
             
             # Expand to batch dimension (we're processing one mosaic per batch item)
@@ -869,20 +885,29 @@ def tf_random_mosaic(images: tf.Tensor,
                 
                 # Pad to max_boxes_per_image (capacity already expanded to 4×)
                 # NEVER truncate - this would silently drop detections and corrupt supervision
+                # If capacity is exceeded, this indicates insufficient expansion and should be fixed
                 num_boxes = tf.shape(merged_boxes)[0]
                 padding_needed = max_boxes_per_image - num_boxes
                 
-                def pad_boxes():
-                    padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
-                    return tf.concat([merged_boxes, padding], axis=0)
+                # Check for overflow and raise error if it occurs
+                # Use tf.Assert to check at runtime (not during graph tracing)
+                overflow_condition = num_boxes > max_boxes_per_image
+                tf.debugging.assert_equal(
+                    overflow_condition,
+                    False,
+                    message="Mosaic augmentation (batch): Box capacity overflow. "
+                            "Merged boxes exceed configured capacity. "
+                            "This indicates insufficient capacity expansion. "
+                            "Remedies: (1) Increase max_boxes_per_image in config, "
+                            "(2) Reduce mosaic_prob or mixup_prob to lower expansion factor, "
+                            "or (3) Check that expansion factor calculation is correct (expected: 4× for Mosaic-only, 8× for Mosaic+MixUp)."
+                )
                 
-                def no_pad():
-                    return merged_boxes
-                
+                # Pad if needed, otherwise return as-is
                 merged_boxes = tf.cond(
                     padding_needed > 0,
-                    pad_boxes,
-                    no_pad
+                    lambda: tf.concat([merged_boxes, tf.zeros([padding_needed, 5], dtype=tf.float32)], axis=0),
+                    lambda: merged_boxes
                 )
                 
                 return merged_img, merged_boxes
@@ -931,14 +956,22 @@ def tf_random_mixup(images: tf.Tensor,
     - mixed_boxes = concatenate(boxes1, boxes2)
     
     CRITICAL: This function preserves ALL boxes from both source images.
-    Box capacity must be expanded to 2× before calling this function to prevent truncation.
-    The old implementation silently truncated boxes to single-image max_boxes, discarding
-    up to 50% of objects per composite and corrupting supervision signals.
+    Box capacity must be expanded to 2× (or 8× if Mosaic is also enabled) before calling 
+    this function to prevent truncation. The old implementation silently truncated boxes 
+    to single-image max_boxes, discarding up to 50% of objects per composite and 
+    corrupting supervision signals, causing val_loss to diverge during fine-tuning and 
+    "untraining" pretrained weights.
+    
+    Fixed-capacity padding ensures every batch has consistent tensor shapes, preventing
+    shape inconsistencies that corrupt training. Explicit capacity expansion (2× for MixUp,
+    4× for Mosaic, 8× for both) ensures no ground-truth boxes are lost unless physically
+    cropped out of the image bounds.
     
     Args:
         images: Batch of images tensor of shape (batch_size, H, W, 3) with dtype float32 [0, 1]
         boxes: Batch of boxes tensor of shape (batch_size, max_boxes, 5) in format (x1, y1, x2, y2, class)
-               NOTE: max_boxes should be 2× the single-image capacity to accommodate all merged boxes
+               NOTE: max_boxes should be 2× (or 8× if Mosaic is also enabled) the single-image 
+               capacity to accommodate all merged boxes
         prob: Probability of applying MixUp (default: 0.15 to avoid over-augmentation)
         alpha: Beta distribution parameter for mixing ratio (default: 0.2, typical range: 0.1-0.4)
         
@@ -1009,21 +1042,30 @@ def tf_random_mixup(images: tf.Tensor,
             
             # Pad to max_boxes (capacity already expanded to 2×)
             # NEVER truncate - this would silently drop detections and corrupt supervision
+            # If capacity is exceeded, this indicates insufficient expansion and should be fixed
             max_boxes = tf.shape(boxes)[1]
             num_boxes = tf.shape(mixed_boxes)[0]
             padding_needed = max_boxes - num_boxes
             
-            def pad_boxes():
-                padding = tf.zeros([padding_needed, 5], dtype=tf.float32)
-                return tf.concat([mixed_boxes, padding], axis=0)
+            # Check for overflow and raise error if it occurs
+            # Use tf.Assert to check at runtime (not during graph tracing)
+            overflow_condition = num_boxes > max_boxes
+            tf.debugging.assert_equal(
+                overflow_condition,
+                False,
+                message="MixUp augmentation: Box capacity overflow. "
+                        "Mixed boxes exceed configured capacity. "
+                        "This indicates insufficient capacity expansion. "
+                        "Remedies: (1) Increase max_boxes_per_image in config, "
+                        "(2) Reduce mixup_prob or mosaic_prob to lower expansion factor, "
+                        "or (3) Check that expansion factor calculation is correct (expected: 2× for MixUp-only, 8× for Mosaic+MixUp)."
+            )
             
-            def no_pad():
-                return mixed_boxes
-            
+            # Pad if needed, otherwise return as-is
             mixed_boxes = tf.cond(
                 padding_needed > 0,
-                pad_boxes,
-                no_pad
+                lambda: tf.concat([mixed_boxes, tf.zeros([padding_needed, 5], dtype=tf.float32)], axis=0),
+                lambda: mixed_boxes
             )
             
             return mixed_img, mixed_boxes
@@ -1260,6 +1302,35 @@ def tf_best_fit_anchor(box: tf.Tensor, anchors: List[tf.Tensor]) -> Tuple[tf.Ten
 class MultiGridDataGenerator(Sequence):
     """
     Optimized data generator for MultiGridDet with TensorFlow 2.17+ features.
+    
+    CRITICAL CAPACITY GUARANTEES:
+    Both data-loader modes (tf.data via build_tf_dataset and legacy Sequence via __getitem__)
+    provide the same robustness guarantees:
+    
+    1. Fixed-capacity padding: All batches have consistent tensor shapes
+       - Base capacity: max_boxes_per_image (default: 100)
+       - Expanded capacity: max_boxes_per_image * expansion_factor
+       - Final shape: [batch_size, max_boxes_per_image * expansion_factor, 5]
+    
+    2. Capacity expansion: Automatically expands based on enabled augmentations
+       - 8× for Mosaic+MixUp (can combine up to 8 source images)
+       - 4× for Mosaic only (merges 4 images)
+       - 2× for MixUp only (merges 2 images)
+       - 1× for no batch augmentations
+    
+    3. Hard failure on overflow: Raises InvalidArgumentError/RuntimeError if capacity exceeded
+       - Never silently truncates labels
+       - Error messages include clear remedies (increase max_boxes_per_image, reduce probabilities)
+       - Training stops immediately to prevent corrupted supervision signals
+    
+    4. Validation: Both paths validate box capacity matches expected value
+       - tf.data path: Uses tf.debugging.assert_equal in _process_batch_wrapper
+       - Legacy path: Uses _validate_box_capacity in __getitem__
+    
+    These guarantees prevent fine-tuning from "untraining" pretrained weights by ensuring:
+    - No variable shapes that corrupt training
+    - No silent label truncation (previous implementation dropped up to 75% of labels)
+    - Consistent behavior regardless of data-loader mode
     """
     
     def __init__(self, 
@@ -1277,6 +1348,7 @@ class MultiGridDataGenerator(Sequence):
                  num_workers: int = 8,
                  mosaic_prob: float = 0.3,
                  mixup_prob: float = 0.1,
+                 max_boxes_per_image: int = 100,
                  **kwargs):
         """
         Initialize the optimized data generator.
@@ -1296,6 +1368,7 @@ class MultiGridDataGenerator(Sequence):
             num_workers: Number of worker threads
             mosaic_prob: Probability of applying Mosaic augmentation (default: 0.3, suitable for fine-tuning)
             mixup_prob: Probability of applying MixUp augmentation (default: 0.1, suitable for fine-tuning)
+            max_boxes_per_image: Fixed capacity for box tensors per image (default: 100)
         """
         # Call parent class constructor for Keras 3.0 compatibility
         super().__init__(**kwargs)
@@ -1313,6 +1386,7 @@ class MultiGridDataGenerator(Sequence):
         self.num_workers = num_workers
         self.mosaic_prob = mosaic_prob
         self.mixup_prob = mixup_prob
+        self.max_boxes_per_image = max_boxes_per_image
         
         # Initialize indexes
         self.indexes = np.arange(len(self.annotation_lines))
@@ -1348,6 +1422,95 @@ class MultiGridDataGenerator(Sequence):
         
         return anchor_mask_per_scale
     
+    def _calculate_expansion_factor(self) -> int:
+        """
+        Calculate capacity expansion factor based on enabled augmentations.
+        
+        This matches the logic in _expand_box_capacity to ensure consistency
+        between tf.data and legacy Sequence paths.
+        
+        Returns:
+            Expansion factor: 8× (Mosaic+MixUp), 4× (Mosaic only), 2× (MixUp only), 1× (neither)
+        """
+        # Check if Mosaic is enabled (both enhance_type and probability > 0)
+        mosaic_enabled = (self.enhance_augment == 'mosaic') and (self.mosaic_prob > 0.0)
+        
+        # Check if MixUp is enabled (probability > 0)
+        mixup_enabled = self.mixup_prob > 0.0
+        
+        # Calculate expansion factor based on enabled augmentations
+        # CRITICAL: Mosaic+MixUp can combine 8 source images (4 from Mosaic × 2 from MixUp)
+        if mosaic_enabled and mixup_enabled:
+            return 8  # Mosaic (4×) + MixUp (2×) = 8× total capacity
+        elif mosaic_enabled:
+            return 4  # Mosaic merges 4 images
+        elif mixup_enabled:
+            return 2  # MixUp merges 2 images
+        else:
+            return 1  # No batch augmentations, no expansion needed
+    
+    def _pad_boxes_to_fixed_capacity(self, boxes: np.ndarray, target_capacity: int) -> np.ndarray:
+        """
+        Pad boxes array to fixed capacity.
+        
+        CRITICAL: This ensures consistent tensor shapes across all batches.
+        The legacy Sequence path must use the same fixed-capacity guarantees as tf.data.
+        
+        Args:
+            boxes: Box array of shape (num_boxes, 5) or (batch_size, num_boxes, 5)
+            target_capacity: Target number of boxes per image
+            
+        Returns:
+            Padded boxes array with shape matching input but last dimension padded to target_capacity
+        """
+        if len(boxes.shape) == 2:
+            # Single image: (num_boxes, 5) -> (target_capacity, 5)
+            num_boxes = boxes.shape[0]
+            if num_boxes > target_capacity:
+                raise RuntimeError(
+                    f"Box capacity overflow: {num_boxes} boxes exceed capacity {target_capacity}. "
+                    f"Increase max_boxes_per_image or reduce augmentation probabilities."
+                )
+            if num_boxes < target_capacity:
+                padding = np.zeros((target_capacity - num_boxes, 5), dtype=boxes.dtype)
+                return np.concatenate([boxes, padding], axis=0)
+            return boxes
+        else:
+            # Batch: (batch_size, num_boxes, 5) -> (batch_size, target_capacity, 5)
+            batch_size, num_boxes = boxes.shape[:2]
+            if num_boxes > target_capacity:
+                raise RuntimeError(
+                    f"Box capacity overflow: {num_boxes} boxes exceed capacity {target_capacity}. "
+                    f"Increase max_boxes_per_image or reduce augmentation probabilities."
+                )
+            if num_boxes < target_capacity:
+                padding = np.zeros((batch_size, target_capacity - num_boxes, 5), dtype=boxes.dtype)
+                return np.concatenate([boxes, padding], axis=1)
+            return boxes
+    
+    def _validate_box_capacity(self, boxes: np.ndarray, expected_capacity: int, context: str = ""):
+        """
+        Validate that boxes have the expected capacity.
+        
+        Args:
+            boxes: Box array to validate
+            expected_capacity: Expected number of boxes per image
+            context: Optional context string for error messages
+            
+        Raises:
+            RuntimeError: If box capacity doesn't match expected value
+        """
+        if len(boxes.shape) == 2:
+            actual_capacity = boxes.shape[0]
+        else:
+            actual_capacity = boxes.shape[1]
+        
+        if actual_capacity != expected_capacity:
+            raise RuntimeError(
+                f"Box capacity mismatch{context}: expected {expected_capacity}, got {actual_capacity}. "
+                f"This indicates a bug in capacity expansion logic."
+            )
+    
     def _load_and_preprocess_single(self, annotation_line: str, target_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load and preprocess a single image (used for parallel processing).
@@ -1366,7 +1529,33 @@ class MultiGridDataGenerator(Sequence):
         return max(1, math.ceil(len(self.annotation_lines) / float(self.batch_size)))
     
     def __getitem__(self, index):
-        """Get batch at specified index."""
+        """
+        Get batch at specified index (legacy Sequence path).
+        
+        CRITICAL GUARANTEES:
+        - Fixed-capacity padding: All batches have shape [batch_size, max_boxes_per_image * expansion_factor, 5]
+        - Capacity expansion: Automatically expands based on enabled augmentations (same logic as tf.data path)
+          * 8× for Mosaic+MixUp
+          * 4× for Mosaic only
+          * 2× for MixUp only
+          * 1× for no batch augmentations
+        - Batch augmentations: Applies Mosaic/MixUp if enabled (same as tf.data path)
+        - No truncation: Raises RuntimeError if capacity is exceeded (never silently drops labels)
+        - Validation: Validates final box capacity matches expected value
+        
+        These guarantees ensure that disabling tf.data does not reintroduce variable shapes
+        or truncated labels. Both data-loader modes (tf.data and Sequence) produce identical
+        tensor shapes and error behavior.
+        
+        Args:
+            index: Batch index
+            
+        Returns:
+            Tuple of ((image_data, *y_true), dummy_target) where:
+            - image_data: (batch_size, H, W, 3) normalized float32 images
+            - y_true: List of target tensors for each detection layer
+            - dummy_target: Dummy target array (not used)
+        """
         # Multi-scale training: select target shape but keep model input fixed
         current_target_shape = self.input_shape  # Default to base shape
         if self.rescale_interval > 0:
@@ -1438,17 +1627,65 @@ class MultiGridDataGenerator(Sequence):
                     _boxes[:, [1, 3]] = (_boxes[:, [1, 3]] * scale_y).astype('float32')  # y coordinates
                 image_data.append(image)
                 box_data.append(_boxes)
-        image_data = np.array(image_data)
-        max_boxes_per_img = 0
-        for boxes in box_data:
-            if len(boxes) > max_boxes_per_img:
-                max_boxes_per_img = len(boxes)
+        
+        # CRITICAL: Use fixed capacity instead of computing max_boxes_per_img dynamically
+        # This ensures consistent tensor shapes across all batches, matching the tf.data path
+        # First, pad each image's boxes to base capacity (before expansion)
         for k, boxes in enumerate(box_data):
-            new_boxes = np.zeros((max_boxes_per_img, 5))
-            if len(boxes) > 0:
-                new_boxes[:len(boxes)] = boxes
-            box_data[k] = new_boxes
-        box_data = np.array(box_data)
+            box_data[k] = self._pad_boxes_to_fixed_capacity(boxes, self.max_boxes_per_image)
+        
+        # Stack into batch format
+        image_data = np.array(image_data)
+        box_data = np.array(box_data)  # Shape: (batch_size, max_boxes_per_image, 5)
+        
+        # Calculate expansion factor based on enabled augmentations (same logic as tf.data path)
+        expansion_factor = self._calculate_expansion_factor()
+        target_capacity = self.max_boxes_per_image * expansion_factor
+        
+        # Apply batch-level augmentations if enabled (Mosaic, MixUp)
+        # Convert to TensorFlow tensors to reuse existing augmentation functions
+        if self.augment:
+            # Convert to float32 and normalize images if needed
+            if image_data.dtype != np.float32:
+                image_data = image_data.astype(np.float32)
+            if image_data.max() > 1.0:
+                image_data = image_data / 255.0
+            
+            # Convert to TensorFlow tensors
+            images_tf = tf.constant(image_data, dtype=tf.float32)
+            boxes_tf = tf.constant(box_data, dtype=tf.float32)
+            
+            # Expand capacity before applying augmentations
+            if expansion_factor > 1:
+                batch_size = box_data.shape[0]
+                padding_needed = target_capacity - self.max_boxes_per_image
+                padding = tf.zeros([batch_size, padding_needed, 5], dtype=tf.float32)
+                boxes_tf = tf.concat([boxes_tf, padding], axis=1)
+            
+            # Apply Mosaic if enabled
+            if self.enhance_augment == 'mosaic' and self.mosaic_prob > 0.0:
+                images_tf, boxes_tf = tf_random_mosaic(images_tf, boxes_tf, prob=self.mosaic_prob)
+            
+            # Apply MixUp if enabled
+            if self.mixup_prob > 0.0:
+                images_tf, boxes_tf = tf_random_mixup(images_tf, boxes_tf, prob=self.mixup_prob, alpha=0.2)
+            
+            # Convert back to numpy
+            image_data = images_tf.numpy()
+            box_data = boxes_tf.numpy()
+            
+            # Ensure boxes are padded to target capacity (augmentations may have changed shape)
+            box_data = self._pad_boxes_to_fixed_capacity(box_data, target_capacity)
+        else:
+            # No augmentations, but still need to expand capacity if expansion_factor > 1
+            # (for consistency with tf.data path, though expansion shouldn't be needed without augmentations)
+            if expansion_factor > 1:
+                box_data = self._pad_boxes_to_fixed_capacity(box_data, target_capacity)
+        
+        # Validate final capacity matches expected value
+        self._validate_box_capacity(box_data, target_capacity, " in __getitem__ after augmentations")
+        
+        # Process boxes into y_true format
         y_true = preprocess_true_boxes(box_data, self.input_shape, self.anchors, self.num_classes,
                                        self.multi_anchor_assign, grid_shapes=self.grid_shapes)
 
@@ -1469,6 +1706,15 @@ class MultiGridDataGenerator(Sequence):
         
         This creates a true tf.data pipeline that can be parallelized and run on GPU,
         unlike from_generator() which still runs Python code on CPU.
+        
+        CRITICAL GUARANTEES (same as legacy Sequence path):
+        - Fixed-capacity padding: All batches have shape [batch_size, max_boxes_per_image * expansion_factor, 5]
+        - Capacity expansion: Automatically expands based on enabled augmentations (8×, 4×, 2×, or 1×)
+        - Hard failure on overflow: Raises InvalidArgumentError if capacity exceeded
+        - Validation: Validates box capacity in _process_batch_wrapper using tf.debugging.assert_equal
+        
+        These guarantees ensure consistent behavior with the legacy Sequence path (__getitem__).
+        Both paths produce identical tensor shapes and error behavior.
         
         Args:
             prefetch_buffer_size: Number of batches to prefetch. Use tf.data.AUTOTUNE for automatic tuning.
@@ -1611,11 +1857,12 @@ class MultiGridDataGenerator(Sequence):
         
         dataset = dataset.map(_preprocess_image_and_boxes, num_parallel_calls=num_parallel_calls)
         
-        # Batch the dataset - use padded_batch to handle variable-length boxes
-        # This automatically pads boxes to the same length in the batch
+        # Batch the dataset - use padded_batch with fixed capacity for consistent batch shapes
+        # CRITICAL: Fixed capacity prevents shape inconsistencies that corrupt training
+        # Every batch must have the same box tensor shape: [batch_size, max_boxes_per_image, 5]
         padded_shapes = (
             [self.input_shape[0], self.input_shape[1], 3],  # image shape
-            [None, 5]  # boxes shape (variable length, will be padded)
+            [self.max_boxes_per_image, 5]  # boxes shape (fixed capacity, prevents shape inconsistencies)
         )
         padding_values = (
             0.0,  # image padding (shouldn't be needed, but just in case)
@@ -1637,28 +1884,41 @@ class MultiGridDataGenerator(Sequence):
                 """
                 Expand box capacity to accommodate composite images from batch augmentations.
                 
-                This prevents silent truncation that corrupts supervision:
-                - Mosaic merges 4 images, so needs 4× capacity
-                - MixUp merges 2 images, so needs 2× capacity
-                - If both enabled, use 4× (max of both)
+                CRITICAL: This function prevents silent truncation that corrupts supervision signals.
+                The previous implementation dropped up to 75% of labels, causing val_loss to diverge
+                during fine-tuning and "untraining" pretrained weights.
                 
-                Old implementation truncated to single-image max_boxes, discarding
-                up to 75% of objects per composite and causing val_loss to diverge.
+                Capacity expansion logic:
+                - Mosaic merges 4 images → needs 4× capacity
+                - MixUp merges 2 images → needs 2× capacity  
+                - Mosaic + MixUp can combine up to 8 images (4 from Mosaic, then 2× for MixUp) → needs 8× capacity
+                - If neither is enabled, no expansion needed (1×)
+                
+                This explicit expansion ensures every batch has consistent tensor shapes and no
+                ground-truth boxes are lost unless physically cropped out of the image bounds.
                 """
                 current_max_boxes = tf.shape(boxes_dense)[1]
                 
-                # Determine expansion factor based on enabled augmentations
-                # Mosaic needs 4× capacity (merges 4 images), MixUp needs 2× (merges 2 images)
-                # If both enabled, use 4× (max of both)
-                # Always expand if augmentations are enabled to be safe
-                if self.enhance_augment == 'mosaic':
+                # Check if Mosaic is enabled (both enhance_type and probability > 0)
+                mosaic_enabled = (self.enhance_augment == 'mosaic') and (self.mosaic_prob > 0.0)
+                
+                # Check if MixUp is enabled (probability > 0)
+                mixup_enabled = self.mixup_prob > 0.0
+                
+                # Calculate expansion factor based on enabled augmentations
+                # CRITICAL: Mosaic+MixUp can combine 8 source images (4 from Mosaic × 2 from MixUp)
+                if mosaic_enabled and mixup_enabled:
+                    expansion_factor = 8  # Mosaic (4×) + MixUp (2×) = 8× total capacity
+                elif mosaic_enabled:
                     expansion_factor = 4  # Mosaic merges 4 images
+                elif mixup_enabled:
+                    expansion_factor = 2  # MixUp merges 2 images
                 else:
-                    expansion_factor = 2  # MixUp merges 2 images (or no batch aug, but safe to expand)
+                    expansion_factor = 1  # No batch augmentations, no expansion needed
                 
                 target_max_boxes = current_max_boxes * expansion_factor
                 
-                # Pad boxes to expanded capacity
+                # Pad boxes to expanded capacity explicitly (no TensorFlow slicing)
                 batch_size = tf.shape(boxes_dense)[0]
                 padding_needed = target_max_boxes - current_max_boxes
                 
@@ -1680,17 +1940,25 @@ class MultiGridDataGenerator(Sequence):
             mixup_prob = getattr(self, 'mixup_prob', 0.1)
             
             def _apply_batch_augmentations(images, boxes_dense):
-                """Apply batch-level augmentations (Mosaic, MixUp)."""
-                # Apply Mosaic if enabled
-                # Conservative default probability (0.3) suitable for fine-tuning
+                """
+                Apply batch-level augmentations (Mosaic, MixUp) only when enabled.
+                
+                CRITICAL: Only apply augmentations when their probabilities are > 0.
+                This ensures fine-tuning can disable augmentations (e.g., mixup_prob=0) to match
+                the data distribution of pretrained checkpoints, preventing "untraining" of weights.
+                """
+                # Apply Mosaic only if enhance_type is 'mosaic' AND probability > 0
                 # Mosaic combines 4 images, increasing effective batch size and context diversity
-                if self.enhance_augment == 'mosaic':
+                # Conservative default probability (0.3) suitable for fine-tuning
+                if self.enhance_augment == 'mosaic' and mosaic_prob > 0.0:
                     images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=mosaic_prob)
                 
-                # Apply MixUp with conservative probability to prevent over-augmentation
+                # Apply MixUp only if probability > 0
+                # CRITICAL: MixUp defaults to 0 for fine-tuning to match pretrained checkpoint distribution
                 # MixUp blends two images, which can make objects hard to distinguish
-                # Conservative default (0.1) maintains data quality while providing regularization
-                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=mixup_prob, alpha=0.2)
+                # When enabled, conservative default (0.1) maintains data quality while providing regularization
+                if mixup_prob > 0.0:
+                    images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=mixup_prob, alpha=0.2)
                 
                 return images, boxes_dense
             
@@ -1701,10 +1969,42 @@ class MultiGridDataGenerator(Sequence):
             """
             Process batch using pure TensorFlow operations.
             This uses the fully vectorized tf_preprocess_true_boxes.
+            
+            CRITICAL: This function validates that boxes_dense has the expected capacity
+            after expansion and augmentations. Both tf.data and legacy Sequence paths
+            must produce boxes with shape [batch_size, max_boxes_per_image * expansion_factor, 5].
             """
             batch_size = tf.shape(images)[0]
             
-            # boxes_dense is already padded from padded_batch
+            # Validate box capacity matches expected value after expansion
+            # Calculate expected capacity based on enabled augmentations
+            if self.augment:
+                mosaic_enabled = (self.enhance_augment == 'mosaic') and (self.mosaic_prob > 0.0)
+                mixup_enabled = self.mixup_prob > 0.0
+                if mosaic_enabled and mixup_enabled:
+                    expected_expansion = 8
+                elif mosaic_enabled:
+                    expected_expansion = 4
+                elif mixup_enabled:
+                    expected_expansion = 2
+                else:
+                    expected_expansion = 1
+            else:
+                expected_expansion = 1
+            
+            expected_capacity = self.max_boxes_per_image * expected_expansion
+            actual_capacity = tf.shape(boxes_dense)[1]
+            
+            # Assert capacity matches expected value (raises InvalidArgumentError if mismatch)
+            tf.debugging.assert_equal(
+                actual_capacity,
+                expected_capacity,
+                message=f"Box capacity mismatch in build_tf_dataset: expected {expected_capacity} "
+                       f"(max_boxes_per_image={self.max_boxes_per_image} × expansion={expected_expansion}), "
+                       f"got {actual_capacity}. This indicates a bug in capacity expansion logic."
+            )
+            
+            # boxes_dense is already padded from padded_batch and expanded
             # Filter out invalid boxes (all zeros) - but keep structure for vectorized processing
             # The vectorized function handles invalid boxes via valid_mask
             
