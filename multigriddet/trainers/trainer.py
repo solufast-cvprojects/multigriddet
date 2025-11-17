@@ -442,19 +442,26 @@ class MultiGridTrainer:
         print(f"   Loss Option: {training_config.get('loss_option', 2)}")
         print()
         
-        # Two-stage training (optional)
+        # Multi-stage training (optional)
+        # The model is already frozen during building based on freeze_level in config
+        # This section handles the transfer learning stage and transition to full fine-tuning
         transfer_epochs = training_config.get('transfer_epochs', 0)
         if transfer_epochs > 0 and initial_epoch < transfer_epochs:
-            print(f"🔒 Stage 1: Transfer Learning ({transfer_epochs} epochs with frozen backbone)")
-            
-            # Freeze backbone layers only if transfer_epochs > 0
-            # When transfer_epochs == 0, fine-tuning runs without frozen backbone
             freeze_level = training_config.get('freeze_level', 1)
-            if freeze_level > 0:
-                # Freeze backbone (first 185 layers for darknet53)
-                for layer in self.model.layers[:185]:
-                    layer.trainable = False
-                print(f"   Frozen first 185 layers")
+            
+            # Count frozen layers to report current state
+            # Model was already frozen during building, so we just report the state
+            frozen_count = sum(1 for layer in self.model.layers if not layer.trainable)
+            total_count = len(self.model.layers)
+            
+            if freeze_level == 2:
+                print(f"🔒 Stage 1: Transfer Learning ({transfer_epochs} epochs with frozen backbone+neck, head trainable)")
+            elif freeze_level == 1:
+                print(f"🔒 Stage 1: Transfer Learning ({transfer_epochs} epochs with frozen backbone only)")
+            else:
+                print(f"🔒 Stage 1: Transfer Learning ({transfer_epochs} epochs)")
+            
+            print(f"   Frozen layers: {frozen_count}/{total_count} (freeze_level: {freeze_level})")
             
             # No recompilation needed in Keras 3.x - model is already compiled
             
@@ -475,10 +482,27 @@ class MultiGridTrainer:
                 verbose=1
             )
             
-            # Unfreeze all layers for stage 2
-            print(f"\n🔓 Stage 2: Fine-tuning (all layers trainable)")
-            for layer in self.model.layers:
-                layer.trainable = True
+            # Transition to stage 2: Unfreeze based on next freeze_level
+            # If freeze_level was 2, we might want to go to 1 (freeze backbone only)
+            # If freeze_level was 1, we go to 0 (unfreeze all)
+            # For now, we always unfreeze all for stage 2
+            # For three-stage training (2→1→0), user should manually update config and resume
+            next_freeze_level = training_config.get('next_freeze_level', 0)
+            
+            if next_freeze_level == 1:
+                # Transition: freeze_level 2 → 1 (unfreeze neck, keep backbone frozen)
+                # Find backbone length (typically 185 for darknet53)
+                # We'll unfreeze layers after backbone
+                backbone_len = 185  # Default for darknet53
+                for i in range(backbone_len, len(self.model.layers)):
+                    self.model.layers[i].trainable = True
+                print(f"\n🔓 Stage 2: Fine-tuning (backbone frozen, neck+head trainable)")
+                print(f"   Unfroze layers {backbone_len} to {len(self.model.layers)-1}")
+            else:
+                # Transition: unfreeze all (freeze_level 1 → 0 or 2 → 0)
+                for layer in self.model.layers:
+                    layer.trainable = True
+                print(f"\n🔓 Stage 2: Fine-tuning (all layers trainable)")
             
             # Recompile model to refresh trainable variables after unfreezing
             # Get optimizer and loss from current model

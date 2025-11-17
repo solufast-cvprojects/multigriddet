@@ -97,14 +97,11 @@ class DiagnosticMultiGridLoss(MultiGridLoss):
             # Get grid shape
             grid_shape = (K.shape(y_pred_layer)[1], K.shape(y_pred_layer)[2])
             
-            # Compute ignore mask
-            if self.loss_option == 2:
-                ignore_mask = self._compute_ignore_mask(
-                    pred_xy, pred_wh, true_xy, true_wh,
-                    anchor_layer, object_mask, y_true_layer, grid_shape
-                )
-            else:
-                ignore_mask = tf.zeros_like(object_mask)
+            # Compute ignore mask for all loss options
+            ignore_mask = self._compute_ignore_mask(
+                pred_xy, pred_wh, true_xy, true_wh,
+                anchor_layer, object_mask, y_true_layer, grid_shape
+            )
             
             # ========== LOCALIZATION LOSS ==========
             loc_norm_factor = self._get_normalization_factor(batch_size, grid_shape, object_mask)

@@ -262,17 +262,15 @@ class MultiGridLoss:
             tf.debugging.assert_positive(grid_shape[0], message=f"grid_h must be positive")
             tf.debugging.assert_positive(grid_shape[1], message=f"grid_w must be positive")
             
-            # Compute ignore mask (only for option 2, otherwise return zeros)
-            if self.loss_option == 2:
-                ignore_mask = self._compute_ignore_mask(
-                    pred_xy, pred_wh, true_xy, true_wh,
-                    anchor_layer, object_mask, y_true_layer, grid_shape
-                )
-                # Debug: Assert ignore mask shape matches object mask
-                tf.debugging.assert_equal(tf.shape(ignore_mask), tf.shape(object_mask), 
-                                        message=f"Ignore mask shape mismatch at layer {layer_idx}")
-            else:
-                ignore_mask = tf.zeros_like(object_mask)
+            # Compute ignore mask for all loss options
+            # Ignore mask prevents objectness/anchor loss on cells with high IoU but not assigned as positive
+            ignore_mask = self._compute_ignore_mask(
+                pred_xy, pred_wh, true_xy, true_wh,
+                anchor_layer, object_mask, y_true_layer, grid_shape
+            )
+            # Debug: Assert ignore mask shape matches object mask
+            tf.debugging.assert_equal(tf.shape(ignore_mask), tf.shape(object_mask), 
+                                    message=f"Ignore mask shape mismatch at layer {layer_idx}")
             
             # ========== LOCALIZATION LOSS ==========
             # Get grid shape for normalization
@@ -424,17 +422,23 @@ class MultiGridLoss:
                             anchors: np.ndarray, object_mask: tf.Tensor,
                             y_true_layer: tf.Tensor, grid_shape: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
         """
-        Compute ignore mask for anchor loss.
+        Compute ignore mask for objectness and anchor loss.
         Ignore predictions with IoU > ignore_thresh but not assigned as positive.
         
         This implementation computes IoU between predicted boxes (for each anchor) and
         all ground truth boxes in the image, marking cells as ignore if they have high
         IoU with a GT box but are not assigned as positive.
         
+        CRITICAL: Applies tanh(0.15*x) + sigmoid(0.15*x) activation to pred_xy before
+        computing IoU. This matches the inference pipeline and ensures ignore masks are
+        computed using the same decoded coordinates that the model actually predicts.
+        Without this activation, IoU uses raw logits which don't match decoded predictions,
+        leading to incorrect ignore masks and loss divergence during fine-tuning.
+        
         Args:
-            pred_xy: Predicted center coordinates [batch, grid_h, grid_w, 2] (grid-relative)
+            pred_xy: Predicted center coordinates [batch, grid_h, grid_w, 2] (grid-relative, raw logits)
             pred_wh: Predicted width/height [batch, grid_h, grid_w, 2] (log-space: log(wh/anchor))
-            true_xy: True center coordinates [batch, grid_h, grid_w, 2] (grid-relative)
+            true_xy: True center coordinates [batch, grid_h, grid_w, 2] (grid-relative, already activated)
             true_wh: True width/height [batch, grid_h, grid_w, 2] (log-space: log(wh/anchor))
             anchors: Anchor array for this layer [num_anchors, 2]
             object_mask: Object presence mask [batch, grid_h, grid_w, 1]
@@ -442,7 +446,7 @@ class MultiGridLoss:
             grid_shape: Grid shape (grid_h, grid_w)
         
         Returns:
-            Ignore mask [batch, grid_h, grid_w, 1]
+            Ignore mask [batch, grid_h, grid_w, 1] - 1.0 where cells should be ignored, 0.0 otherwise
         """
         batch_size = K.shape(pred_xy)[0]
         grid_h, grid_w = grid_shape
@@ -496,8 +500,14 @@ class MultiGridLoss:
         true_wh_flat = tf.reshape(true_wh_abs, [batch_size, -1, 2])  # [batch, grid_h*grid_w, 2]
         object_mask_flat = tf.reshape(object_mask, [batch_size, -1])  # [batch, grid_h*grid_w]
         
+        # Apply activation to pred_xy before converting to absolute coordinates
+        # This matches the inference pipeline: tanh(0.15*x) + sigmoid(0.15*x) to reach [-1, 2] range
+        # CRITICAL: Without this activation, IoU computation uses raw logits which don't match
+        # the actual decoded predictions, leading to incorrect ignore masks and loss divergence
+        pred_xy_activated = tf.nn.tanh(0.15 * pred_xy) + tf.nn.sigmoid(0.15 * pred_xy)
+        
         # Convert predicted boxes to absolute coordinates for each anchor
-        pred_xy_abs = (pred_xy + grid_coords) * scale  # [batch, grid_h, grid_w, 2]
+        pred_xy_abs = (pred_xy_activated + grid_coords) * scale  # [batch, grid_h, grid_w, 2]
         
         # For each anchor, compute predicted boxes and IoU with GT
         anchors_tf_expanded = tf.reshape(anchors_tf, [1, 1, 1, num_anchors, 2])  # [1, 1, 1, num_anchors, 2]
@@ -666,17 +676,18 @@ class MultiGridLoss:
         """
         Compute anchor prediction loss using BCE.
         
-        CRITICAL FIX: Anchor loss is now computed ONLY on object cells (like classification loss).
+        Anchor loss is computed ONLY on object cells (like classification loss).
         Anchor prediction answers "which anchor fits this object best", so it should only
-        be computed where objects exist. Computing on negative cells was causing the loss
-        to be dominated by negative cells (85%+ contribution), making it 6-8x larger than
-        it should be.
+        be computed where objects exist.
         
-        Formula (Fixed):
-        L_anchor = Σ object_mask * object_scale * BCE(true_anchors, pred_anchors) / normalization
+        Formula:
+        L_anchor = Σ object_mask * (1 - ignore_mask) * BCE(true_anchors, pred_anchors) / normalization
+        
+        Note: anchor_scale is applied when composing total loss, not here.
+        This decouples anchor scaling from object_scale for better controllability.
         
         This includes:
-        - Positive cells (object_mask > 0): weighted by object_scale
+        - Positive cells (object_mask > 0): included in loss
         - Negative cells: EXCLUDED (anchor prediction doesn't apply to background)
         - Ignore cells (ignore_mask > 0): excluded from loss
         """
@@ -690,7 +701,7 @@ class MultiGridLoss:
         # Anchor prediction is about "which anchor fits this object best", so it only
         # makes sense for cells that contain objects
         # Broadcasting: [batch, grid_h, grid_w, 1] × [batch, grid_h, grid_w, num_anchors]
-        anchor_loss = anchor_loss * object_mask * self.object_scale
+        anchor_loss = anchor_loss * object_mask
         
         # Exclude ignore cells (if any)
         anchor_loss = anchor_loss * (1.0 - ignore_mask)

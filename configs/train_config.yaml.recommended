@@ -1,0 +1,159 @@
+# Recommended Training Configuration for A100 80GB
+# Based on best practices for fine-tuning without "untraining" pretrained weights
+#
+# IMPORTANT: This config uses clear_session=True automatically (via build_multigriddet_darknet_train)
+#            to ensure layer names match pretrained weights, preventing silent loading failures
+
+# Model configuration
+model_config: configs/models/multigriddet_darknet.yaml
+
+# Dataset paths
+data:
+  train_annotation: data/coco/coco_train2017.txt
+  val_annotation: data/coco/coco_val2017.txt
+  classes_path: configs/coco_classes.txt
+
+# Data loader configuration (optimized for A100 80GB)
+data_loader:
+  use_tf_dataset: true
+  use_gpu_preprocessing: true
+  prefetch_buffer: 6
+  num_parallel_calls: 24
+  shuffle_buffer_size: 8192
+  interleave_cycle_length: null  # Auto-disable for frozen backbone, enable (8-16) for full training
+  num_workers: 8
+  cache_images: false
+
+# Training parameters
+training:
+  # Batch size optimized for A100 80GB with 608x608 inputs
+  # Can go up to 64 if memory allows, but 48 is safer and still very efficient
+  batch_size: 48
+  
+  epochs: 100
+  initial_epoch: 0
+  
+  # Learning rate strategy for fine-tuning:
+  # - Stage 1 (frozen): 1e-4 (conservative, prevents drift)
+  # - Stage 2 (partial): 5e-5 (slightly lower, still conservative)
+  # - Stage 3 (full): 3e-5 (lowest, allows fine-tuning without untraining)
+  # For backbone-only: Start at 1e-4, then 2e-4 briefly after unfreezing
+  learning_rate: 0.0001  # Will be adjusted per stage
+  
+  # Three-stage training strategy for model5.h5 (full pretrained weights):
+  # Stage 1: Freeze all but head (freeze_level: 2) - 5 epochs
+  #   - Purpose: Let head adapt to new data distribution without touching backbone
+  #   - Mosaic/MixUp: DISABLED (clean boxes for frozen trunk)
+  #   - LR: 1e-4
+  #
+  # Stage 2: Freeze backbone only (freeze_level: 1) - 5-10 epochs
+  #   - Purpose: Gradually adapt neck/head while keeping backbone stable
+  #   - Mosaic/MixUp: ENABLED (0.3/0.1) - moderate augmentation
+  #   - LR: 5e-5
+  #
+  # Stage 3: Unfreeze all (freeze_level: 0) - remaining epochs
+  #   - Purpose: Full fine-tuning with very low LR to avoid untraining
+  #   - Mosaic/MixUp: ENABLED (0.3/0.1) - full augmentation
+  #   - LR: 3e-5
+  #
+  # For backbone-only weights:
+  # Stage 1: Freeze backbone (freeze_level: 1) - 10 epochs
+  #   - Purpose: Train randomly initialized head with stable backbone
+  #   - Mosaic/MixUp: ENABLED (head needs diversity)
+  #   - LR: 1e-4
+  #
+  # Stage 2: Unfreeze all (freeze_level: 0) - remaining epochs
+  #   - Purpose: Full training with brief LR boost, then decay
+  #   - Mosaic/MixUp: ENABLED
+  #   - LR: 2e-4 for 1-2 epochs, then follow cosine schedule
+  
+  # Stage 1: Freeze all but head (for full model weights) or backbone (for backbone-only)
+  transfer_epochs: 5      # For model5.h5: 5 epochs with freeze_level: 2, then 5-10 with freeze_level: 1
+                          # For backbone-only: 10 epochs with freeze_level: 1
+  freeze_level: 2         # For model5.h5: Start with 2, then change to 1, then 0
+                          # For backbone-only: Start with 1, then change to 0
+  
+  # Loss configuration
+  loss_option: 2          # IoL-MSE + anchor (recommended, matches model5.h5 training)
+  label_smoothing: 0.01
+  elim_grid_sense: false
+  
+  # Loss scales (matching model5.h5 training recipe - DO NOT DEVIATE MUCH)
+  # These values were used to train model5.h5, so large changes risk "untraining"
+  loss:
+    coord_scale: 5.0     # Keep at 5.0 (matches original training)
+    object_scale: 1.0     # Keep at 1.0
+    no_object_scale: 0.5  # Keep at 0.5 (prevents negative cell dominance)
+    class_scale: 1.0      # Keep at 1.0
+    anchor_scale: 1.0     # Keep at 1.0 (now decoupled from object_scale after fix)
+  
+  # Loss normalization: ["batch"] keeps pretrained head from being shocked by different scaling
+  # Adding "positives" can help when Mosaic injects many objects, but start with ["batch"] only
+  loss_normalization: ["batch"]
+  
+  # Class weights
+  class_weights: auto
+  class_weights_method: balanced
+  
+  # Data augmentation
+  # CRITICAL: Disable Mosaic/MixUp during frozen stages to prevent "untraining"
+  #           Frozen layers should see clean boxes, not heavily augmented ones
+  augmentation:
+    enabled: true
+    enhance_type: null
+    mosaic_prob: 0.0      # Stage 1 (frozen): 0.0, Stage 2+: 0.3
+    mixup_prob: 0.0        # Stage 1 (frozen): 0.0, Stage 2+: 0.1
+    rescale_interval: -1   # Disable multi-scale during fine-tuning (can cause instability)
+    max_boxes_per_image: 100
+  
+  multi_anchor_assign: false
+
+# Optimizer configuration
+optimizer:
+  type: adam              # Adam is stable and well-understood for fine-tuning
+  learning_rate: 0.0001  # Will be overridden by training.learning_rate
+  beta_1: 0.9
+  beta_2: 0.999
+  epsilon: 1.0e-7
+  weight_decay: 0.0005    # For AdamW (if used)
+
+# Learning rate schedule
+# Cosine annealing with warmup is ideal for fine-tuning
+# Warmup helps prevent initial shock to pretrained weights
+lr_schedule:
+  type: cosine_annealing
+  warmup_epochs: 3        # 3-5 epochs warmup (gradual LR increase)
+  warmup_lr_factor: 0.01  # Start at 1% of initial LR
+  min_lr: 1.0e-7          # Minimum LR at end of cosine decay
+
+# Callbacks
+callbacks:
+  checkpoint:
+    save_best_only: true
+    monitor: val_loss
+    save_dir: logs/checkpoints
+  tensorboard:
+    log_dir: logs/tensorboard
+  early_stopping:
+    monitor: val_loss
+    patience: 10
+
+# Resume training
+# For model5.h5 (full pretrained weights):
+resume:
+  enabled: true
+  weights_path: weights/model5.h5  # Full model weights
+  backbone_weights_path: null
+
+# For backbone-only weights:
+# resume:
+#   enabled: true
+#   weights_path: null
+#   backbone_weights_path: weights/darknet53.h5  # Backbone weights only
+
+# Output
+output:
+  log_dir: logs/training
+  model_dir: trained_models
+  save_frequency: 1
+
