@@ -1,36 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Regression test suite for Mosaic augmentation with visual verification.
+Regression test suite for Mosaic augmentation using the actual training pipeline.
 
-This module provides automated testing and visual validation for the Mosaic augmentation
-pipeline. Mosaic augmentation combines four training images into a single composite image,
-effectively increasing the effective batch size and introducing diverse contextual information.
+This script:
+    1. Loads the training config and builds a MultiGridDataGenerator using real augmentation settings
+    2. Uses build_visualization_dataset() so Mosaic/MixUp and all geometry come from generators.py
+    3. Draws bounding boxes with **class names** (not indices) on the augmented images
+    4. Saves grid visualizations for manual inspection of Mosaic behavior
 
-The test verifies:
-    1. Box coordinates are correctly transformed when quadrants are pasted
-    2. Boxes align properly with objects in the combined mosaic image
-    3. No boxes are lost or incorrectly positioned during the combination process
-    4. Coordinate transformations maintain geometric consistency
-
-Usage Examples:
-    # Basic usage with default settings
-    python tests/test_mosaic_augmentation.py --annotation data/coco_train2017.txt --num-tests 5
-
-    # With custom seed for reproducibility
-    python tests/test_mosaic_augmentation.py --annotation data/coco_train2017.txt \\
-        --num-tests 5 --seed 42
-
-    # Custom input shape and output directory
-    python tests/test_mosaic_augmentation.py --annotation data/coco_train2017.txt \\
-        --num-tests 10 --input-shape 640 640 --output-dir tests/my_mosaic_tests
-
-Output:
-    Generates grid visualizations showing all 4 original images plus the resulting mosaic.
-    Visualizations are saved to tests/mosaic_test_outputs/ by default.
-
-Author:
-    MultiGridDet Project
+The goal is to verify Mosaic as the model actually sees it during training, instead of
+re-implementing augmentation logic in this test.
 """
 
 import argparse
@@ -41,71 +21,20 @@ import numpy as np
 import tensorflow as tf
 import cv2
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
-# Add project root to path
+# Add project root and tests directory to path
 project_root = Path(__file__).parent.parent
+tests_dir = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(tests_dir))
 
-from multigriddet.data.generators import (
-    tf_load_and_decode_image,
-    tf_parse_annotation_line,
-    tf_parse_boxes,
-    tf_letterbox_resize,
-    tf_random_mosaic
+from test_utils import (
+    load_class_names_from_config,
+    convert_image_to_uint8,
+    draw_boxes_with_class_names,
+    get_generator_from_config,
 )
-from multigriddet.data.utils import load_annotation_lines
-
-
-def draw_boxes_on_image(image: np.ndarray, boxes: np.ndarray, 
-                        color: Tuple[int, int, int] = (0, 255, 0),
-                        thickness: int = 2) -> np.ndarray:
-    """
-    Draw bounding boxes on image.
-    
-    Args:
-        image: Image array (H, W, 3) in range [0, 1] or [0, 255]
-        boxes: Boxes array (N, 5) in format (x1, y1, x2, y2, class)
-        color: RGB color for boxes
-        thickness: Line thickness
-        
-    Returns:
-        Image with boxes drawn
-    """
-    # Convert image to uint8 if needed
-    if image.dtype == np.float32 or image.dtype == np.float64:
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
-    
-    image_copy = image.copy()
-    
-    for box in boxes:
-        x1, y1, x2, y2, cls = box
-        # Skip invalid boxes
-        if x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0:
-            continue
-        
-        # Ensure coordinates are integers and within image bounds
-        x1 = int(np.clip(x1, 0, image_copy.shape[1] - 1))
-        y1 = int(np.clip(y1, 0, image_copy.shape[0] - 1))
-        x2 = int(np.clip(x2, 0, image_copy.shape[1] - 1))
-        y2 = int(np.clip(y2, 0, image_copy.shape[0] - 1))
-        
-        # Draw rectangle
-        cv2.rectangle(image_copy, (x1, y1), (x2, y2), color, thickness)
-        
-        # Draw class label
-        label = f"cls:{int(cls)}"
-        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image_copy, (x1, y1 - text_height - 4), 
-                     (x1 + text_width, y1), color, -1)
-        cv2.putText(image_copy, label, (x1, y1 - 2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    return image_copy
 
 
 def create_visualization_grid(images: List[np.ndarray], titles: List[str],
@@ -143,18 +72,18 @@ def create_visualization_grid(images: List[np.ndarray], titles: List[str],
     plt.close()
 
 
-def test_mosaic_augmentation(annotation_lines: List[str], 
-                            input_shape: Tuple[int, int] = (608, 608),
-                            num_tests: int = 5,
-                            seed: int = 42,
-                            output_dir: str = "tests/mosaic_test_outputs"):
+def test_mosaic_augmentation(config_path: str,
+                             num_batches: int = 3,
+                             batch_size: int = 4,
+                             seed: int = 42,
+                             output_dir: str = "tests/mosaic_test_outputs") -> None:
     """
-    Test Mosaic augmentation with visual verification.
+    Test Mosaic augmentation using the real training pipeline (MultiGridDataGenerator).
     
     Args:
-        annotation_lines: List of annotation lines
-        input_shape: Input image shape (height, width)
-        num_tests: Number of test cases to run
+        config_path: Path to training config YAML file
+        num_batches: Number of batches to visualize
+        batch_size: Batch size for the generator
         seed: Random seed for reproducibility
         output_dir: Directory to save visualizations
     """
@@ -165,166 +94,88 @@ def test_mosaic_augmentation(annotation_lines: List[str],
     tf.random.set_seed(seed)
     
     print("=" * 80)
-    print("Mosaic Augmentation Regression Test")
+    print("Mosaic Augmentation Regression Test (Pipeline-accurate)")
     print("=" * 80)
-    print(f"Input shape: {input_shape}")
-    print(f"Number of tests: {num_tests}")
+    print(f"Config: {config_path}")
+    print(f"Number of batches: {num_batches}")
+    print(f"Batch size: {batch_size}")
     print(f"Random seed: {seed}")
     print(f"Output directory: {output_dir}")
     print()
     
-    # Filter annotation lines that have boxes
-    valid_lines = []
-    for line in annotation_lines:
-        parts = line.strip().split()
-        if len(parts) > 1:  # Has boxes
-            valid_lines.append(line)
+    # Load class names and colors from config
+    class_names, colors = load_class_names_from_config(config_path)
+    num_classes = len(class_names)
+    print(f"Loaded {num_classes} classes from config")
     
-    if len(valid_lines) < 4:
-        print(f"[ERROR] Need at least 4 annotation lines with boxes, found {len(valid_lines)}")
-        return
+    # Build generator using the same settings as training
+    print("Creating generator from config (including Mosaic/MixUp settings)...")
+    generator = get_generator_from_config(
+        config_path=config_path,
+        augment=True,
+        batch_size=batch_size
+    )
+    # Force Mosaic augmentation for this regression test, regardless of current training config.
+    # This keeps the test focused on verifying Mosaic behavior while still using the exact
+    # implementation from the training pipeline.
+    generator.enhance_augment = 'mosaic'
+    generator.mosaic_prob = 1.0
+    generator.mixup_prob = 0.0
+    print("   Overriding augmentation for test: enhance_augment='mosaic', mosaic_prob=1.0, mixup_prob=0.0")
     
-    print(f"Found {len(valid_lines)} valid annotation lines with boxes")
+    # Build visualization dataset that returns (images, boxes_dense)
+    # This uses the exact same preprocessing and batch augmentations as training.
+    print("Building visualization dataset...")
+    dataset = generator.build_visualization_dataset(
+        prefetch_buffer_size=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        shuffle_buffer_size=4096,
+        interleave_cycle_length=None
+    )
+    print("   Dataset built")
     print()
     
-    # Run tests
-    for test_idx in range(num_tests):
-        print(f"Test {test_idx + 1}/{num_tests}...")
+    batch_count = 0
+    for images, boxes in dataset:
+        if batch_count >= num_batches:
+            break
         
-        # Select 4 random annotation lines
-        selected_indices = np.random.choice(len(valid_lines), size=4, replace=False)
-        selected_lines = [valid_lines[i] for i in selected_indices]
+        batch_size_actual = int(images.shape[0])
+        print(f"Batch {batch_count + 1}/{num_batches} (size: {batch_size_actual})")
         
-        # Load and preprocess images and boxes
-        images_list = []
-        boxes_list = []
-        image_paths = []
+        images_np = images.numpy()
+        boxes_np = boxes.numpy()
         
-        for line in selected_lines:
-            # Parse annotation line
-            parts = line.strip().split()
-            image_path = parts[0]
-            boxes_str = ' '.join(parts[1:]) if len(parts) > 1 else ''
+        # Collect BGR images with class-name overlays for this batch
+        batch_images_with_boxes = []
+        titles = []
+        
+        for sample_idx in range(batch_size_actual):
+            img = images_np[sample_idx]
+            bxs = boxes_np[sample_idx]
             
-            # Load image
-            image_tf = tf_load_and_decode_image(tf.constant(image_path, dtype=tf.string))
-            image_np = image_tf.numpy()
+            # Count valid boxes (exclude padded zeros)
+            valid_mask = np.any(bxs[:, :4] != 0, axis=1)
+            bxs_valid = bxs[valid_mask]
             
-            # Get original image dimensions
-            orig_h, orig_w = image_np.shape[:2]
-            
-            # Resize to input shape with padding info
-            result = tf_letterbox_resize(
-                image_tf,
-                input_shape,
-                return_padding_info=True
+            # Convert image to uint8 and draw boxes with class names
+            img_uint8 = convert_image_to_uint8(img)
+            img_with_boxes_bgr = draw_boxes_with_class_names(
+                img_uint8,
+                bxs_valid,
+                class_names,
+                colors,
+                show_score=False
             )
-            image_resized = result[0]
-            padding_size = result[1]  # (new_w, new_h)
-            offset = result[2]  # (pad_left, pad_top)
             
-            image_resized_np = image_resized.numpy()
-            
-            # Parse boxes
-            boxes_tf = tf_parse_boxes(tf.constant(boxes_str, dtype=tf.string))
-            boxes_np = boxes_tf.numpy()
-            
-            # Scale boxes to match letterbox resize
-            # Letterbox resize: scale image, then pad to target size
-            target_h, target_w = input_shape
-            scale = min(target_w / orig_w, target_h / orig_h)
-            
-            # Get padding info from TensorFlow tensors
-            pad_left = int(offset[0].numpy())
-            pad_top = int(offset[1].numpy())
-            
-            # Scale boxes and add padding offset
-            if len(boxes_np) > 0:
-                boxes_np[:, 0] = boxes_np[:, 0] * scale + pad_left  # x1
-                boxes_np[:, 1] = boxes_np[:, 1] * scale + pad_top   # y1
-                boxes_np[:, 2] = boxes_np[:, 2] * scale + pad_left  # x2
-                boxes_np[:, 3] = boxes_np[:, 3] * scale + pad_top   # y2
-            
-            images_list.append(image_resized_np)
-            boxes_list.append(boxes_np)
-            image_paths.append(image_path)
+            batch_images_with_boxes.append(img_with_boxes_bgr)
+            titles.append(f"Batch {batch_count+1} Sample {sample_idx+1} ({len(bxs_valid)} boxes)")
         
-        # Prepare batch for Mosaic augmentation
-        # Stack images: (4, H, W, 3)
-        images_batch = tf.stack([tf.constant(img, dtype=tf.float32) for img in images_list])
+        # Create a grid visualization for this batch
+        output_path = os.path.join(output_dir, f"mosaic_batch_{batch_count + 1:03d}.png")
+        create_visualization_grid(batch_images_with_boxes, titles, output_path, figsize=(5 * batch_size_actual, 5))
         
-        # Pad boxes to same length and stack: (4, max_boxes, 5)
-        max_boxes = max(len(boxes) for boxes in boxes_list) if boxes_list else 1
-        max_boxes = max(max_boxes, 10)  # Ensure minimum size
-        
-        boxes_padded = []
-        for boxes in boxes_list:
-            if len(boxes) == 0:
-                padded = np.zeros((max_boxes, 5), dtype=np.float32)
-            else:
-                padded = np.zeros((max_boxes, 5), dtype=np.float32)
-                padded[:len(boxes)] = boxes
-            boxes_padded.append(padded)
-        
-        boxes_batch = tf.stack([tf.constant(boxes, dtype=tf.float32) for boxes in boxes_padded])
-        
-        # Apply Mosaic augmentation
-        # Note: tf_random_mosaic expects images in [0, 1] range
-        images_normalized = images_batch / 255.0
-        
-        # Set seed for this specific augmentation
-        tf.random.set_seed(seed + test_idx)
-        
-        mosaic_image, mosaic_boxes = tf_random_mosaic(
-            images_normalized,
-            boxes_batch,
-            prob=1.0,  # Always apply
-            min_offset=0.2
-        )
-        
-        # Convert back to numpy
-        mosaic_image_np = (mosaic_image[0].numpy() * 255.0).astype(np.uint8)
-        mosaic_boxes_np = mosaic_boxes[0].numpy()
-        
-        # Filter out invalid boxes (all zeros)
-        valid_mask = np.any(mosaic_boxes_np[:, :4] != 0, axis=1)
-        mosaic_boxes_valid = mosaic_boxes_np[valid_mask]
-        
-        print(f"   Original boxes: {[len(boxes) for boxes in boxes_list]}")
-        print(f"   Mosaic boxes: {len(mosaic_boxes_valid)}")
-        
-        # Debug: Print sample box coordinates to verify transformation
-        if len(mosaic_boxes_valid) > 0:
-            sample_box = mosaic_boxes_valid[0]
-            print(f"   Sample mosaic box: x1={sample_box[0]:.1f}, y1={sample_box[1]:.1f}, x2={sample_box[2]:.1f}, y2={sample_box[3]:.1f}, cls={sample_box[4]}")
-        if len(boxes_list) > 0 and len(boxes_list[0]) > 0:
-            sample_orig = boxes_list[0][0]
-            print(f"   Sample original box (img0): x1={sample_orig[0]:.1f}, y1={sample_orig[1]:.1f}, x2={sample_orig[2]:.1f}, y2={sample_orig[3]:.1f}, cls={sample_orig[4]}")
-        
-        # Create visualizations
-        # 1. Original images with boxes
-        original_images_with_boxes = []
-        for img, boxes in zip(images_list, boxes_list):
-            img_uint8 = (img * 255.0).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-            img_with_boxes = draw_boxes_on_image(img_uint8, boxes, color=(0, 255, 0), thickness=2)
-            original_images_with_boxes.append(img_with_boxes)
-        
-        # 2. Mosaic image with boxes
-        mosaic_with_boxes = draw_boxes_on_image(mosaic_image_np, mosaic_boxes_valid, 
-                                                color=(255, 0, 0), thickness=3)
-        
-        # Create grid visualization
-        all_images = original_images_with_boxes + [mosaic_with_boxes]
-        all_titles = [f"Original {i+1}" for i in range(4)] + ["Mosaic Result"]
-        
-        output_path = os.path.join(output_dir, f"mosaic_test_{test_idx + 1:03d}.png")
-        create_visualization_grid(all_images, all_titles, output_path, figsize=(25, 5))
-        
-        # Also save individual mosaic result
-        mosaic_output_path = os.path.join(output_dir, f"mosaic_only_{test_idx + 1:03d}.png")
-        cv2.imwrite(mosaic_output_path, cv2.cvtColor(mosaic_with_boxes, cv2.COLOR_RGB2BGR))
-        
-        print(f"   Saved test visualization")
+        batch_count += 1
         print()
     
     print("=" * 80)
@@ -332,42 +183,41 @@ def test_mosaic_augmentation(annotation_lines: List[str],
     print(f"Visualizations saved to: {output_dir}")
     print()
     print("Visual Inspection Checklist:")
-    print("  - Check that boxes in Mosaic result align with objects")
-    print("  - Verify boxes from different quadrants are correctly positioned")
+    print("  - Check that boxes in each composite image align with objects")
+    print("  - Verify images exhibit Mosaic behavior (multiple source images per sample)")
     print("  - Ensure no boxes are outside image boundaries")
-    print("  - Confirm boxes maintain correct class labels")
+    print("  - Confirm boxes maintain correct class labels (via class names)")
     print("=" * 80)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Test Mosaic augmentation with visual verification',
+        description='Test Mosaic augmentation using the real training pipeline',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        '--annotation',
+        '--config',
         type=str,
         required=True,
-        help='Path to annotation file'
+        help='Path to training config YAML file'
     )
     parser.add_argument(
-        '--num-tests',
+        '--num-batches',
         type=int,
-        default=5,
-        help='Number of test cases to run'
+        default=3,
+        help='Number of batches to visualize'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=4,
+        help='Batch size for the generator used in this test'
     )
     parser.add_argument(
         '--seed',
         type=int,
         default=42,
         help='Random seed for reproducibility'
-    )
-    parser.add_argument(
-        '--input-shape',
-        type=int,
-        nargs=2,
-        default=[608, 608],
-        help='Input image shape (height width)'
     )
     parser.add_argument(
         '--output-dir',
@@ -378,17 +228,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Load annotation lines
-    print(f"Loading annotations from: {args.annotation}")
-    annotation_lines = load_annotation_lines(args.annotation, shuffle=False)
-    print(f"Loaded {len(annotation_lines)} annotation lines")
-    print()
-    
-    # Run tests
     test_mosaic_augmentation(
-        annotation_lines=annotation_lines,
-        input_shape=tuple(args.input_shape),
-        num_tests=args.num_tests,
+        config_path=args.config,
+        num_batches=args.num_batches,
+        batch_size=args.batch_size,
         seed=args.seed,
         output_dir=args.output_dir
     )

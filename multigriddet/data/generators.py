@@ -258,39 +258,87 @@ def tf_random_horizontal_flip(image: tf.Tensor, boxes: tf.Tensor) -> Tuple[tf.Te
 
 
 def tf_random_brightness(image: tf.Tensor, max_delta: float = 0.2) -> tf.Tensor:
-    """Apply random brightness adjustment."""
-    return tf.image.random_brightness(image, max_delta=max_delta)
+    """
+    Apply random brightness adjustment.
+    
+    Works on images in [0, 255] range (uint8 or float32).
+    Results are clipped to [0, 255] to prevent negative values.
+    """
+    # Convert to [0, 1] for tf.image.random_brightness, then convert back
+    # This ensures we work with TensorFlow's expected range
+    image_01 = image / 255.0
+    image_bright = tf.image.random_brightness(image_01, max_delta=max_delta)
+    # Clip to [0, 1] then convert back to [0, 255]
+    image_bright = tf.clip_by_value(image_bright, 0.0, 1.0)
+    return image_bright * 255.0
 
 
 def tf_random_contrast(image: tf.Tensor, lower: float = 0.8, upper: float = 1.2) -> tf.Tensor:
-    """Apply random contrast adjustment."""
-    return tf.image.random_contrast(image, lower=lower, upper=upper)
+    """
+    Apply random contrast adjustment.
+    
+    Works on images in [0, 255] range (uint8 or float32).
+    Results are clipped to [0, 255] to prevent values outside range.
+    """
+    # Convert to [0, 1] for tf.image.random_contrast, then convert back
+    image_01 = image / 255.0
+    image_contrast = tf.image.random_contrast(image_01, lower=lower, upper=upper)
+    # Clip to [0, 1] then convert back to [0, 255]
+    image_contrast = tf.clip_by_value(image_contrast, 0.0, 1.0)
+    return image_contrast * 255.0
 
 
 def tf_random_saturation(image: tf.Tensor, lower: float = 0.8, upper: float = 1.2) -> tf.Tensor:
-    """Apply random saturation adjustment."""
-    return tf.image.random_saturation(image, lower=lower, upper=upper)
+    """
+    Apply random saturation adjustment.
+    
+    Works on images in [0, 255] range (uint8 or float32).
+    Results are clipped to [0, 255] to prevent values outside range.
+    """
+    # Convert to [0, 1] for tf.image.random_saturation, then convert back
+    image_01 = image / 255.0
+    image_sat = tf.image.random_saturation(image_01, lower=lower, upper=upper)
+    # Clip to [0, 1] then convert back to [0, 255]
+    image_sat = tf.clip_by_value(image_sat, 0.0, 1.0)
+    return image_sat * 255.0
 
 
 def tf_random_hue(image: tf.Tensor, max_delta: float = 0.1) -> tf.Tensor:
-    """Apply random hue adjustment."""
-    return tf.image.random_hue(image, max_delta=max_delta)
+    """
+    Apply random hue adjustment.
+    
+    Works on images in [0, 255] range (uint8 or float32).
+    Results are clipped to [0, 255] to prevent values outside range.
+    """
+    # Convert to [0, 1] for tf.image.random_hue, then convert back
+    image_01 = image / 255.0
+    image_hue = tf.image.random_hue(image_01, max_delta=max_delta)
+    # Clip to [0, 1] then convert back to [0, 255]
+    image_hue = tf.clip_by_value(image_hue, 0.0, 1.0)
+    return image_hue * 255.0
 
 
 def tf_random_grayscale(image: tf.Tensor, probability: float = 0.1) -> tf.Tensor:
     """
     Randomly convert image to grayscale.
     
+    Works on images in [0, 255] range (uint8 or float32).
+    Results remain in [0, 255] range.
+    
     Args:
-        image: Image tensor
+        image: Image tensor in [0, 255] range
         probability: Probability of converting to grayscale
         
     Returns:
-        Image tensor (possibly grayscale)
+        Image tensor (possibly grayscale) in [0, 255] range
     """
     def to_grayscale(img):
-        gray = tf.image.rgb_to_grayscale(img)
-        return tf.image.grayscale_to_rgb(gray)
+        # Convert to [0, 1] for grayscale conversion
+        img_01 = img / 255.0
+        gray = tf.image.rgb_to_grayscale(img_01)
+        gray_rgb = tf.image.grayscale_to_rgb(gray)
+        # Convert back to [0, 255]
+        return gray_rgb * 255.0
     
     should_convert = tf.random.uniform([]) < probability
     return tf.cond(should_convert, lambda: to_grayscale(image), lambda: image)
@@ -305,7 +353,7 @@ def tf_random_resize_crop_pad(image: tf.Tensor,
     TensorFlow implementation of random resize crop pad augmentation.
     
     Args:
-        image: Image tensor of shape (H, W, 3) with dtype float32 [0, 1]
+        image: Image tensor of shape (H, W, 3) with dtype float32 in [0, 255] range
         target_size: Target size (height, width)
         boxes: Boxes tensor of shape (N, 5) in format (x1, y1, x2, y2, class)
         aspect_ratio_jitter: Jitter range for random aspect ratio
@@ -314,6 +362,7 @@ def tf_random_resize_crop_pad(image: tf.Tensor,
     Returns:
         Tuple of (augmented_image, augmented_boxes, padding_size, padding_offset)
         where padding_size and padding_offset are (width, height) tuples for box transformation
+        augmented_image is in [0, 255] range
     """
     target_h, target_w = target_size
     image_shape = tf.shape(image)
@@ -347,6 +396,8 @@ def tf_random_resize_crop_pad(image: tf.Tensor,
     
     # Resize image to padding size
     image_resized = tf.image.resize(image, [padding_h, padding_w], method='bicubic')
+    # Clip to [0, 255] range after resize to ensure valid values
+    image_resized = tf.clip_by_value(image_resized, 0.0, 255.0)
     
     # Get random offset
     padding_w_f = tf.cast(padding_w, tf.float32)
@@ -356,8 +407,8 @@ def tf_random_resize_crop_pad(image: tf.Tensor,
     dx = tf.random.uniform([], 0, max_dx, dtype=tf.int32)
     dy = tf.random.uniform([], 0, max_dy, dtype=tf.int32)
     
-    # Create target image with gray background
-    target_image = tf.ones([target_h, target_w, 3], dtype=tf.float32) * 0.5  # Gray = 128/255
+    # Create target image with gray background (128 in [0, 255] range)
+    target_image = tf.ones([target_h, target_w, 3], dtype=tf.float32) * 128.0
     
     # Place resized image at offset
     # Calculate valid region
@@ -394,12 +445,16 @@ def tf_random_resize_crop_pad(image: tf.Tensor,
     boxes_transformed = boxes_transformed + offset_vec
     
     # Clip boxes to image bounds
-    boxes_transformed = tf.clip_by_value(
-        boxes_transformed,
-        [0.0, 0.0, 0.0, 0.0, 0.0],
+    # CRITICAL: Class index (last element) should NOT be clipped - preserve it exactly
+    boxes_coords = boxes_transformed[:, :4]  # [x1, y1, x2, y2]
+    boxes_classes = boxes_transformed[:, 4:5]  # [class] - preserve as-is
+    boxes_coords_clipped = tf.clip_by_value(
+        boxes_coords,
+        [0.0, 0.0, 0.0, 0.0],
         [tf.cast(target_w, tf.float32), tf.cast(target_h, tf.float32), 
-         tf.cast(target_w, tf.float32), tf.cast(target_h, tf.float32), tf.cast(tf.shape(boxes)[0], tf.float32)]
+         tf.cast(target_w, tf.float32), tf.cast(target_h, tf.float32)]
     )
+    boxes_transformed = tf.concat([boxes_coords_clipped, boxes_classes], axis=1)
     
     padding_size = (padding_w, padding_h)
     padding_offset = (dx, dy)
@@ -415,13 +470,13 @@ def tf_random_rotate(image: tf.Tensor,
     TensorFlow implementation of random rotation augmentation.
     
     Args:
-        image: Image tensor of shape (H, W, 3) with dtype float32 [0, 1]
+        image: Image tensor of shape (H, W, 3) with dtype float32 in [0, 255] range
         boxes: Boxes tensor of shape (N, 5) in format (x1, y1, x2, y2, class)
         rotate_range: Rotation range in degrees (sigma for Gaussian)
         prob: Probability of applying rotation
         
     Returns:
-        Tuple of (rotated_image, rotated_boxes)
+        Tuple of (rotated_image, rotated_boxes) where rotated_image is in [0, 255] range
     """
     image_shape = tf.shape(image)
     height = tf.cast(image_shape[0], tf.float32)
@@ -484,12 +539,19 @@ def tf_random_rotate(image: tf.Tensor,
         
         boxes_rotated = rotate_boxes_90(boxes, k)
         
-        # Clip boxes
-        boxes_rotated = tf.clip_by_value(
-            boxes_rotated,
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-            [width, height, width, height, tf.cast(tf.shape(boxes)[0], tf.float32)]
+        # Clip boxes to image bounds
+        # CRITICAL: Class index (last element) should NOT be clipped - preserve it exactly
+        boxes_coords = boxes_rotated[:, :4]  # [x1, y1, x2, y2]
+        boxes_classes = boxes_rotated[:, 4:5]  # [class] - preserve as-is
+        boxes_coords_clipped = tf.clip_by_value(
+            boxes_coords,
+            [0.0, 0.0, 0.0, 0.0],
+            [width, height, width, height]
         )
+        boxes_rotated = tf.concat([boxes_coords_clipped, boxes_classes], axis=1)
+        
+        # Clip image to [0, 255] range to ensure valid values after rotation
+        image_rotated = tf.clip_by_value(image_rotated, 0.0, 255.0)
         
         return image_rotated, boxes_rotated
     
@@ -499,7 +561,8 @@ def tf_random_rotate(image: tf.Tensor,
 def tf_random_mosaic(images: tf.Tensor,
                      boxes: tf.Tensor,
                      prob: float = 1.0,
-                     min_offset: float = 0.2) -> Tuple[tf.Tensor, tf.Tensor]:
+                     min_offset: float = 0.2,
+                     min_box_ratio: float = 0.03) -> Tuple[tf.Tensor, tf.Tensor]:
     """
     TensorFlow implementation of Mosaic augmentation (YOLOv4 style).
     
@@ -646,10 +709,11 @@ def tf_random_mosaic(images: tf.Tensor,
                     x2_new = (x2 - crop_x_f)
                     y2_new = tf.minimum(y2, crop_y_f)
                 
-                # Filter by minimum size (1% of image or 10 pixels)
+                # Filter by minimum size to avoid extremely tiny boxes that are visually meaningless.
+                # min_box_ratio is relative to the shorter image side (default: 3%).
                 box_w = x2_new - x1_new
                 box_h = y2_new - y1_new
-                min_size = tf.maximum(10.0, tf.minimum(width, height) * 0.01)
+                min_size = tf.maximum(10.0, tf.minimum(width, height) * min_box_ratio)
                 size_keep = tf.logical_and(box_w >= min_size, box_h >= min_size)
                 keep = tf.logical_and(keep, size_keep)
                 
@@ -849,10 +913,11 @@ def tf_random_mosaic(images: tf.Tensor,
                         x2_new = tf.minimum(x2, width)
                         y2_new = tf.minimum(y2, crop_y_f)
                     
-                    # Filter by minimum size (1% of image or 10 pixels)
+                    # Filter by minimum size to avoid extremely tiny boxes that are visually meaningless.
+                    # min_box_ratio is relative to the shorter image side (default: 3%).
                     box_w = x2_new - x1_new
                     box_h = y2_new - y1_new
-                    min_size = tf.maximum(10.0, tf.minimum(width, height) * 0.01)
+                    min_size = tf.maximum(10.0, tf.minimum(width, height) * min_box_ratio)
                     size_keep = tf.logical_and(box_w >= min_size, box_h >= min_size)
                     keep = tf.logical_and(keep, size_keep)
                     
@@ -1107,7 +1172,7 @@ def tf_random_gridmask(image: tf.Tensor,
     TensorFlow implementation of GridMask augmentation.
     
     Args:
-        image: Image tensor of shape (H, W, 3) with dtype float32 [0, 1]
+        image: Image tensor of shape (H, W, 3) with dtype float32 in [0, 255] range
         boxes: Boxes tensor of shape (N, 5) in format (x1, y1, x2, y2, class)
         prob: Probability of applying GridMask
         d1_ratio: Minimum grid size ratio (relative to image width)
@@ -1116,7 +1181,7 @@ def tf_random_gridmask(image: tf.Tensor,
         grid_ratio: Ratio of grid lines to grid cells
         
     Returns:
-        Tuple of (augmented_image, filtered_boxes)
+        Tuple of (augmented_image, filtered_boxes) where augmented_image is in [0, 255] range
     """
     image_shape = tf.shape(image)
     height = tf.cast(image_shape[0], tf.float32)
@@ -1184,6 +1249,8 @@ def tf_random_gridmask(image: tf.Tensor,
         # Apply mask to image
         mask_expanded = tf.expand_dims(mask_final, axis=-1)  # (H, W, 1)
         image_masked = image * mask_expanded
+        # Clip to [0, 255] range to ensure valid values
+        image_masked = tf.clip_by_value(image_masked, 0.0, 255.0)
         
         # Filter boxes based on mask coverage
         # Check if boxes have sufficient unmasked area
@@ -1790,8 +1857,9 @@ class MultiGridDataGenerator(Sequence):
             has_multiscale = False
         
         def _preprocess_image_and_boxes(image, boxes, image_path):
-            # Convert image to float32 and normalize
-            image = tf.cast(image, tf.float32) / 255.0
+            # Convert image to float32 but keep in [0, 255] range
+            # Normalization to [0, 1] happens only at the end to prevent negative values from augmentations
+            image = tf.cast(image, tf.float32)
             
             # For multi-scale: sample a random scale factor and resize directly to input_shape
             # This avoids double resizing (target_shape -> input_shape)
@@ -1879,6 +1947,11 @@ class MultiGridDataGenerator(Sequence):
                 # Reduced probability (0.1 = 10%) to balance regularization with data quality
                 # GridMask can obscure important object features if applied too frequently
                 image_resized, boxes = tf_random_gridmask(image_resized, boxes, prob=0.1)
+            
+            # CRITICAL: Normalize to [0, 1] only at the end, after all augmentations
+            # This ensures augmentations work on [0, 255] range and results are clipped properly
+            # Using a single normalization function to maintain consistency
+            image_resized = tf_normalize_image(image_resized)
             
             return image_resized, boxes
         
@@ -2132,6 +2205,197 @@ class MultiGridDataGenerator(Sequence):
             pass
         
         # Prefetch to overlap CPU data preparation with GPU computation
+        dataset = dataset.prefetch(prefetch_buffer_size)
+        
+        return dataset
+    
+    def build_visualization_dataset(self, prefetch_buffer_size=tf.data.AUTOTUNE,
+                                    num_parallel_calls=tf.data.AUTOTUNE,
+                                    shuffle_buffer_size: int = 4096,
+                                    interleave_cycle_length: int = None):
+        """
+        Build a tf.data.Dataset for visualization that returns (images, boxes_dense).
+        
+        Uses the EXACT same pipeline as build_tf_dataset() but returns boxes in [x1, y1, x2, y2, class] format
+        instead of y_true targets. This ensures visualization matches exactly what the model sees.
+        
+        Args:
+            prefetch_buffer_size: Prefetch buffer size
+            num_parallel_calls: Number of parallel calls
+            shuffle_buffer_size: Shuffle buffer size
+            interleave_cycle_length: Interleave cycle length
+            
+        Returns:
+            tf.data.Dataset yielding (images, boxes_dense) tuples
+        """
+        # Build dataset up to the point before _process_batch_wrapper
+        # We replicate the exact same pipeline but stop before y_true conversion
+        AUTOTUNE = tf.data.AUTOTUNE
+        
+        # Create dataset from annotation lines - EXACT same as build_tf_dataset
+        annotation_paths = tf.constant(self.annotation_lines)
+        dataset = tf.data.Dataset.from_tensor_slices(annotation_paths)
+        
+        # Shuffle - EXACT same as build_tf_dataset
+        if self.shuffle:
+            buffer_size = min(shuffle_buffer_size, len(self.annotation_lines))
+            dataset = dataset.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=True)
+        
+        # Load and parse - EXACT same as build_tf_dataset
+        if interleave_cycle_length is not None and interleave_cycle_length > 1:
+            def _load_and_parse(annotation_line):
+                image_path, boxes_string = tf_parse_annotation_line(annotation_line)
+                image = tf_load_and_decode_image(image_path)
+                boxes = tf_parse_boxes(boxes_string)
+                return image, boxes, image_path
+            
+            interleave_parallel_calls = tf.data.AUTOTUNE
+            dataset = dataset.interleave(
+                lambda x: tf.data.Dataset.from_tensors(x).map(_load_and_parse),
+                cycle_length=interleave_cycle_length,
+                block_length=1,
+                num_parallel_calls=interleave_parallel_calls,
+                deterministic=False
+            )
+        else:
+            def _load_and_parse(annotation_line):
+                image_path, boxes_string = tf_parse_annotation_line(annotation_line)
+                image = tf_load_and_decode_image(image_path)
+                boxes = tf_parse_boxes(boxes_string)
+                return image, boxes, image_path
+            
+            dataset = dataset.map(_load_and_parse, num_parallel_calls=num_parallel_calls)
+        
+        # Preprocess - use EXACT same _preprocess_image_and_boxes logic
+        if hasattr(self, 'input_shape_list') and len(self.input_shape_list) > 0:
+            input_shape_list_tf = tf.constant(self.input_shape_list, dtype=tf.int32)
+            input_shape_base_tf = tf.constant(self.input_shape, dtype=tf.int32)
+            has_multiscale = True
+        else:
+            input_shape_list_tf = None
+            input_shape_base_tf = tf.constant(self.input_shape, dtype=tf.int32)
+            has_multiscale = False
+        
+        def _preprocess_image_and_boxes(image, boxes, image_path):
+            # EXACT same preprocessing as build_tf_dataset
+            image_shape = tf.shape(image)
+            src_h = tf.cast(image_shape[0], tf.float32)
+            src_w = tf.cast(image_shape[1], tf.float32)
+            image = tf.cast(image, tf.float32)  # Keep in [0, 255] range
+            
+            if has_multiscale and self.rescale_interval > 0:
+                num_scales = tf.shape(input_shape_list_tf)[0]
+                scale_idx = tf.random.uniform([], 0, num_scales, dtype=tf.int32)
+                target_shape_sample = tf.gather(input_shape_list_tf, scale_idx)
+                scale_h = tf.cast(target_shape_sample[0], tf.float32) / tf.cast(input_shape_base_tf[0], tf.float32)
+                scale_w = tf.cast(target_shape_sample[1], tf.float32) / tf.cast(input_shape_base_tf[1], tf.float32)
+                scaled_h = tf.cast(src_h * scale_h, tf.int32)
+                scaled_w = tf.cast(src_w * scale_w, tf.int32)
+                image_scaled = tf.image.resize(image, [scaled_h, scaled_w], method='bicubic')
+                image_scaled = tf.clip_by_value(image_scaled, 0.0, 255.0)
+                image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
+                    image_scaled, self.input_shape, return_padding_info=True
+                )
+                scale = tf.minimum(
+                    tf.cast(new_w, tf.float32) / tf.cast(scaled_w, tf.float32),
+                    tf.cast(new_h, tf.float32) / tf.cast(scaled_h, tf.float32)
+                )
+                boxes = boxes * tf.stack([scale_w * scale, scale_h * scale, scale_w * scale, scale_h * scale, 1.0])
+                boxes = boxes + tf.stack([
+                    tf.cast(pad_left, tf.float32), tf.cast(pad_top, tf.float32),
+                    tf.cast(pad_left, tf.float32), tf.cast(pad_top, tf.float32), 0.0
+                ])
+            else:
+                image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
+                    image, self.input_shape, return_padding_info=True
+                )
+                scale = tf.minimum(
+                    tf.cast(new_w, tf.float32) / src_w,
+                    tf.cast(new_h, tf.float32) / src_h
+                )
+                pad_left_f = tf.cast(pad_left, tf.float32)
+                pad_top_f = tf.cast(pad_top, tf.float32)
+                boxes = boxes * tf.stack([scale, scale, scale, scale, 1.0])
+                boxes = boxes + tf.stack([pad_left_f, pad_top_f, pad_left_f, pad_top_f, 0.0])
+            
+            # Apply augmentations - EXACT same as build_tf_dataset
+            if self.augment:
+                image_resized, boxes, _, _ = tf_random_resize_crop_pad(
+                    image_resized, self.input_shape, boxes,
+                    aspect_ratio_jitter=0.3, scale_jitter=0.5
+                )
+                image_resized, boxes = tf_random_horizontal_flip(image_resized, boxes)
+                image_resized = tf_random_brightness(image_resized, max_delta=0.2)
+                image_resized = tf_random_contrast(image_resized, lower=0.8, upper=1.2)
+                image_resized = tf_random_saturation(image_resized, lower=0.8, upper=1.2)
+                image_resized = tf_random_hue(image_resized, max_delta=0.1)
+                image_resized = tf_random_grayscale(image_resized, probability=0.1)
+                image_resized, boxes = tf_random_rotate(image_resized, boxes, rotate_range=20.0, prob=0.05)
+                image_resized, boxes = tf_random_gridmask(image_resized, boxes, prob=0.1)
+            
+            # Normalize at the end - EXACT same as build_tf_dataset
+            image_resized = tf_normalize_image(image_resized)
+            
+            return image_resized, boxes
+        
+        dataset = dataset.map(_preprocess_image_and_boxes, num_parallel_calls=num_parallel_calls)
+        
+        # Batch - EXACT same as build_tf_dataset
+        padded_shapes = (
+            [self.input_shape[0], self.input_shape[1], 3],
+            [self.max_boxes_per_image, 5]
+        )
+        padding_values = (0.0, 0.0)
+        dataset = dataset.padded_batch(
+            self.batch_size,
+            padded_shapes=padded_shapes,
+            padding_values=padding_values,
+            drop_remainder=False
+        )
+        
+        # Expand capacity and batch augmentations - EXACT same as build_tf_dataset
+        if self.augment:
+            def _expand_box_capacity(images, boxes_dense):
+                current_max_boxes = tf.shape(boxes_dense)[1]
+                mosaic_enabled = (self.enhance_augment == 'mosaic') and (self.mosaic_prob > 0.0)
+                mixup_enabled = self.mixup_prob > 0.0
+                
+                if mosaic_enabled and mixup_enabled:
+                    expansion_factor = 8
+                elif mosaic_enabled:
+                    expansion_factor = 4
+                elif mixup_enabled:
+                    expansion_factor = 2
+                else:
+                    expansion_factor = 1
+                
+                target_max_boxes = current_max_boxes * expansion_factor
+                batch_size = tf.shape(boxes_dense)[0]
+                padding_needed = target_max_boxes - current_max_boxes
+                
+                if padding_needed > 0:
+                    padding = tf.zeros([batch_size, padding_needed, 5], dtype=tf.float32)
+                    boxes_expanded = tf.concat([boxes_dense, padding], axis=1)
+                else:
+                    boxes_expanded = boxes_dense
+                
+                return images, boxes_expanded
+            
+            dataset = dataset.map(_expand_box_capacity, num_parallel_calls=num_parallel_calls)
+            
+            # Batch augmentations - EXACT same as build_tf_dataset
+            mosaic_prob = getattr(self, 'mosaic_prob', 0.3)
+            mixup_prob = getattr(self, 'mixup_prob', 0.1)
+            
+            def _apply_batch_augmentations(images, boxes_dense):
+                if self.enhance_augment == 'mosaic' and mosaic_prob > 0.0:
+                    images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=mosaic_prob)
+                if mixup_prob > 0.0:
+                    images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=mixup_prob, alpha=0.2)
+                return images, boxes_dense
+            
+            dataset = dataset.map(_apply_batch_augmentations, num_parallel_calls=num_parallel_calls)
+        
         dataset = dataset.prefetch(prefetch_buffer_size)
         
         return dataset

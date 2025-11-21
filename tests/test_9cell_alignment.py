@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Test that all 9 cells in a 3x3 grid decode to the EXACT same box coordinates.
-This is the core MultiGridDet innovation - multiple cells predict the same object.
+Test that all 9 cells in a 3x3 grid decode to the same box coordinates.
+
+This verifies the core MultiGridDet mechanism where multiple grid cells
+predict the same object, ensuring robust detection.
 """
 
+import sys
+from pathlib import Path
 import numpy as np
 import tensorflow as tf
-from scipy.special import expit
-import sys
-import os
 
 # Add project root to path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from multigriddet.data.generators import tf_preprocess_true_boxes
 
 
 def test_9cell_alignment():
-    """Test that 9 cells decode to the same box center."""
+    """Verify that 9 cells decode to the same box center."""
     print("=" * 60)
-    print("Testing 9-cell alignment (all should decode to same box)")
+    print("Testing 9-cell alignment")
     print("=" * 60)
     
     # Create a single box at a known location
@@ -87,29 +88,19 @@ def test_9cell_alignment():
         for cell_idx in range(num_cells):
             i, j = cells_with_objects[0][cell_idx], cells_with_objects[1][cell_idx]
             
-            # Get stored_xy and raw_wh from y_true
-            # NOTE: y_true now stores already-activated offsets [-kj + ty, -ki + tx]
-            # (matching preprocess_true_boxes behavior)
-            stored_xy = y_true[0, i, j, 0:2]  # (2,) - already-activated offset
-            raw_wh = y_true[0, i, j, 2:4]  # (2,)
+            stored_xy = y_true[0, i, j, 0:2]
+            raw_wh = y_true[0, i, j, 2:4]
             anchor_one_hot = y_true[0, i, j, 5:5+len(anchors[layer_idx])]
             anchor_idx = np.argmax(anchor_one_hot)
             anchor = anchors[layer_idx][anchor_idx].numpy()
             
             raw_xy_values.append(stored_xy.copy())
             
-            # Decode y_true targets (already-activated offsets, no need to apply activation)
-            # Step 1: stored_xy is already activated (no activation needed)
-            activated_xy = stored_xy  # Already activated: [-kj + ty, -ki + tx]
-            
-            # Step 2: Add cell_grid offset
-            cell_grid = np.array([j, i])  # [x, y] = [j, i]
+            activated_xy = stored_xy
+            cell_grid = np.array([j, i])
             box_xy_grid = activated_xy + cell_grid
-            
-            # Step 3: Normalize to [0, 1]
             box_xy_normalized = box_xy_grid / np.array([grid_w, grid_h])
             
-            # Step 4: Convert to pixels
             decoded_cx = box_xy_normalized[0] * input_shape[1]
             decoded_cy = box_xy_normalized[1] * input_shape[0]
             
@@ -170,11 +161,29 @@ def test_9cell_alignment():
             print(f"    ✗ FAIL: Some cells are off by more than 1 pixel")
             print(f"    This suggests the numerical inversion may not be precise enough")
         
-        # Also check stored_xy values - they should be different for each cell
         stored_xy_array = np.array(raw_xy_values)
-        print(f"\n  Stored_xy values (already-activated offsets, should be different for each cell):")
-        print(f"    Range x: [{np.min(stored_xy_array[:, 0]):.3f}, {np.max(stored_xy_array[:, 0]):.3f}]")
-        print(f"    Range y: [{np.min(stored_xy_array[:, 1]):.3f}, {np.max(stored_xy_array[:, 1]):.3f}]")
+        print(f"\n  Stored_xy values (should be different for each cell):")
+        min_x, max_x = np.min(stored_xy_array[:, 0]), np.max(stored_xy_array[:, 0])
+        min_y, max_y = np.min(stored_xy_array[:, 1]), np.max(stored_xy_array[:, 1])
+        print(f"    Range x: [{min_x:.6f}, {max_x:.6f}] (expected: [-1, 2))")
+        print(f"    Range y: [{min_y:.6f}, {max_y:.6f}] (expected: [-1, 2))")
+        
+        epsilon = 1e-6
+        x_in_range = (min_x >= -1.0 - epsilon) and (max_x < 2.0 + epsilon)
+        y_in_range = (min_y >= -1.0 - epsilon) and (max_y < 2.0 + epsilon)
+        x_has_exactly_2 = np.any(np.abs(stored_xy_array[:, 0] - 2.0) < epsilon)
+        y_has_exactly_2 = np.any(np.abs(stored_xy_array[:, 1] - 2.0) < epsilon)
+        
+        if x_in_range and y_in_range and not (x_has_exactly_2 or y_has_exactly_2):
+            print(f"    ✓ PASS: stored_xy values are within expected range [-1, 2)")
+        else:
+            print(f"    ✗ FAIL: stored_xy values are outside expected range [-1, 2)")
+            if not x_in_range:
+                print(f"      X: min={min_x:.9f}, max={max_x:.9f}")
+            if not y_in_range:
+                print(f"      Y: min={min_y:.9f}, max={max_y:.9f}")
+            if x_has_exactly_2 or y_has_exactly_2:
+                print(f"      Values exactly 2.0 detected (should be < 2)")
 
 
 if __name__ == '__main__':

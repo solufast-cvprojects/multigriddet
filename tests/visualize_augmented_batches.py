@@ -27,227 +27,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from multigriddet.config import ConfigLoader
-from multigriddet.data.generators import (
-    MultiGridDataGenerator,
-    tf_parse_annotation_line,
-    tf_load_and_decode_image,
-    tf_parse_boxes,
-    tf_letterbox_resize,
-    tf_random_resize_crop_pad,
-    tf_random_horizontal_flip,
-    tf_random_brightness,
-    tf_random_contrast,
-    tf_random_saturation,
-    tf_random_hue,
-    tf_random_grayscale,
-    tf_random_rotate,
-    tf_random_gridmask,
-    tf_random_mosaic,
-    tf_random_mixup
-)
+from multigriddet.data.generators import MultiGridDataGenerator
 from multigriddet.data.utils import load_annotation_lines, get_classes, get_colors, draw_boxes
 from multigriddet.utils.anchors import load_anchors
 
 
-def build_visualization_dataset(generator: MultiGridDataGenerator,
-                                prefetch_buffer_size=tf.data.AUTOTUNE,
-                                num_parallel_calls=tf.data.AUTOTUNE,
-                                shuffle_buffer_size: int = 4096,
-                                interleave_cycle_length: int = None):
-    """
-    Build a tf.data.Dataset that returns (images, boxes_dense) for visualization.
-    
-    This replicates the pipeline from build_tf_dataset() but stops before _process_batch_wrapper()
-    to capture boxes in their original [x1, y1, x2, y2, class] format.
-    
-    Args:
-        generator: MultiGridDataGenerator instance
-        prefetch_buffer_size: Prefetch buffer size
-        num_parallel_calls: Number of parallel calls
-        shuffle_buffer_size: Shuffle buffer size
-        interleave_cycle_length: Interleave cycle length
-        
-    Returns:
-        tf.data.Dataset yielding (images, boxes_dense) tuples
-    """
-    AUTOTUNE = tf.data.AUTOTUNE
-    
-    # Create dataset from annotation lines
-    annotation_paths = tf.constant(generator.annotation_lines)
-    dataset = tf.data.Dataset.from_tensor_slices(annotation_paths)
-    
-    # Shuffle dataset
-    if generator.shuffle:
-        buffer_size = min(shuffle_buffer_size, len(generator.annotation_lines))
-        dataset = dataset.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=True)
-    
-    # Load and parse annotations
-    if interleave_cycle_length is not None and interleave_cycle_length > 1:
-        def _load_and_parse(annotation_line):
-            image_path, boxes_string = tf_parse_annotation_line(annotation_line)
-            image = tf_load_and_decode_image(image_path)
-            boxes = tf_parse_boxes(boxes_string)
-            return image, boxes, image_path
-        
-        interleave_parallel_calls = tf.data.AUTOTUNE
-        dataset = dataset.interleave(
-            lambda x: tf.data.Dataset.from_tensors(x).map(_load_and_parse),
-            cycle_length=interleave_cycle_length,
-            block_length=1,
-            num_parallel_calls=interleave_parallel_calls,
-            deterministic=False
-        )
-    else:
-        def _load_and_parse(annotation_line):
-            image_path, boxes_string = tf_parse_annotation_line(annotation_line)
-            image = tf_load_and_decode_image(image_path)
-            boxes = tf_parse_boxes(boxes_string)
-            return image, boxes, image_path
-        
-        dataset = dataset.map(_load_and_parse, num_parallel_calls=num_parallel_calls)
-    
-    # Preprocess and augment
-    if hasattr(generator, 'input_shape_list') and len(generator.input_shape_list) > 0:
-        input_shape_list_tf = tf.constant(generator.input_shape_list, dtype=tf.int32)
-        input_shape_base_tf = tf.constant(generator.input_shape, dtype=tf.int32)
-        has_multiscale = True
-    else:
-        input_shape_list_tf = None
-        input_shape_base_tf = tf.constant(generator.input_shape, dtype=tf.int32)
-        has_multiscale = False
-    
-    def _preprocess_image_and_boxes(image, boxes, image_path):
-        # Get original image size BEFORE normalization (boxes are in original coordinates)
-        image_shape = tf.shape(image)
-        src_h = tf.cast(image_shape[0], tf.float32)
-        src_w = tf.cast(image_shape[1], tf.float32)
-        
-        # Convert image to float32 and normalize
-        image = tf.cast(image, tf.float32) / 255.0
-        
-        # Multi-scale handling
-        if has_multiscale and generator.rescale_interval > 0:
-            num_scales = tf.shape(input_shape_list_tf)[0]
-            scale_idx = tf.random.uniform([], 0, num_scales, dtype=tf.int32)
-            target_shape_sample = tf.gather(input_shape_list_tf, scale_idx)
-            scale_h = tf.cast(target_shape_sample[0], tf.float32) / tf.cast(input_shape_base_tf[0], tf.float32)
-            scale_w = tf.cast(target_shape_sample[1], tf.float32) / tf.cast(input_shape_base_tf[1], tf.float32)
-            scaled_h = tf.cast(src_h * scale_h, tf.int32)
-            scaled_w = tf.cast(src_w * scale_w, tf.int32)
-            image_scaled = tf.image.resize(image, [scaled_h, scaled_w], method='bicubic')
-            # Letterbox resize with padding info
-            image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
-                image_scaled, generator.input_shape, return_padding_info=True
-            )
-            # Transform boxes: first scale, then add padding offset
-            scale = tf.minimum(
-                tf.cast(new_w, tf.float32) / tf.cast(scaled_w, tf.float32),
-                tf.cast(new_h, tf.float32) / tf.cast(scaled_h, tf.float32)
-            )
-            boxes = boxes * tf.stack([scale_w * scale, scale_h * scale, scale_w * scale, scale_h * scale, 1.0])
-            boxes = boxes + tf.stack([
-                tf.cast(pad_left, tf.float32),
-                tf.cast(pad_top, tf.float32),
-                tf.cast(pad_left, tf.float32),
-                tf.cast(pad_top, tf.float32),
-                0.0
-            ])
-        else:
-            # Letterbox resize with padding info to transform boxes correctly
-            image_resized, (new_w, new_h), (pad_left, pad_top) = tf_letterbox_resize(
-                image, generator.input_shape, return_padding_info=True
-            )
-            # Transform boxes: scale first, then add padding offset
-            scale = tf.minimum(
-                tf.cast(new_w, tf.float32) / src_w,
-                tf.cast(new_h, tf.float32) / src_h
-            )
-            pad_left_f = tf.cast(pad_left, tf.float32)
-            pad_top_f = tf.cast(pad_top, tf.float32)
-            boxes = boxes * tf.stack([scale, scale, scale, scale, 1.0])
-            boxes = boxes + tf.stack([pad_left_f, pad_top_f, pad_left_f, pad_top_f, 0.0])
-        
-        # Apply augmentations if enabled
-        if generator.augment:
-            image_resized, boxes, _, _ = tf_random_resize_crop_pad(
-                image_resized, generator.input_shape, boxes,
-                aspect_ratio_jitter=0.3, scale_jitter=0.5
-            )
-            image_resized, boxes = tf_random_horizontal_flip(image_resized, boxes)
-            image_resized = tf_random_brightness(image_resized, max_delta=0.2)
-            image_resized = tf_random_contrast(image_resized, lower=0.8, upper=1.2)
-            image_resized = tf_random_saturation(image_resized, lower=0.8, upper=1.2)
-            image_resized = tf_random_hue(image_resized, max_delta=0.1)
-            image_resized = tf_random_grayscale(image_resized, probability=0.1)
-            image_resized, boxes = tf_random_rotate(image_resized, boxes, rotate_range=20.0, prob=0.05)
-            image_resized, boxes = tf_random_gridmask(image_resized, boxes, prob=0.1)
-        
-        return image_resized, boxes
-    
-    dataset = dataset.map(_preprocess_image_and_boxes, num_parallel_calls=num_parallel_calls)
-    
-    # Batch the dataset with fixed capacity padding
-    padded_shapes = (
-        [generator.input_shape[0], generator.input_shape[1], 3],
-        [generator.max_boxes_per_image, 5]
-    )
-    padding_values = (0.0, 0.0)
-    dataset = dataset.padded_batch(
-        generator.batch_size,
-        padded_shapes=padded_shapes,
-        padding_values=padding_values,
-        drop_remainder=False
-    )
-    
-    # Expand box capacity before batch augmentations
-    if generator.augment:
-        def _expand_box_capacity(images, boxes_dense):
-            current_max_boxes = tf.shape(boxes_dense)[1]
-            
-            mosaic_enabled = (generator.enhance_augment == 'mosaic') and (generator.mosaic_prob > 0.0)
-            mixup_enabled = generator.mixup_prob > 0.0
-            
-            if mosaic_enabled and mixup_enabled:
-                expansion_factor = 8
-            elif mosaic_enabled:
-                expansion_factor = 4
-            elif mixup_enabled:
-                expansion_factor = 2
-            else:
-                expansion_factor = 1
-            
-            target_max_boxes = current_max_boxes * expansion_factor
-            batch_size = tf.shape(boxes_dense)[0]
-            padding_needed = target_max_boxes - current_max_boxes
-            
-            if padding_needed > 0:
-                padding = tf.zeros([batch_size, padding_needed, 5], dtype=tf.float32)
-                boxes_expanded = tf.concat([boxes_dense, padding], axis=1)
-            else:
-                boxes_expanded = boxes_dense
-            
-            return images, boxes_expanded
-        
-        dataset = dataset.map(_expand_box_capacity, num_parallel_calls=num_parallel_calls)
-    
-    # Apply batch-level augmentations (Mosaic, MixUp)
-    if generator.augment:
-        mosaic_prob = getattr(generator, 'mosaic_prob', 0.3)
-        mixup_prob = getattr(generator, 'mixup_prob', 0.1)
-        
-        def _apply_batch_augmentations(images, boxes_dense):
-            if generator.enhance_augment == 'mosaic' and mosaic_prob > 0.0:
-                images, boxes_dense = tf_random_mosaic(images, boxes_dense, prob=mosaic_prob)
-            if mixup_prob > 0.0:
-                images, boxes_dense = tf_random_mixup(images, boxes_dense, prob=mixup_prob, alpha=0.2)
-            return images, boxes_dense
-        
-        dataset = dataset.map(_apply_batch_augmentations, num_parallel_calls=num_parallel_calls)
-    
-    # Prefetch for performance
-    dataset = dataset.prefetch(prefetch_buffer_size)
-    
-    return dataset
 
 
 def filter_valid_boxes(boxes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -264,12 +48,18 @@ def filter_valid_boxes(boxes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return np.zeros((0, 5)), np.array([], dtype=int)
     
     # Check for valid boxes (non-zero area and valid coordinates)
+    # CRITICAL: Padded boxes have all zeros (x1=0, y1=0, x2=0, y2=0, class=0)
+    # We need to exclude these by checking that boxes have non-zero area AND non-zero coordinates
+    # Simply checking class >= 0 is insufficient because class 0 might be a valid class!
+    box_areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    has_nonzero_coords = (boxes[:, 0] != 0) | (boxes[:, 1] != 0) | (boxes[:, 2] != 0) | (boxes[:, 3] != 0)
+    
     valid_mask = (
         (boxes[:, 0] < boxes[:, 2]) &  # x1 < x2
         (boxes[:, 1] < boxes[:, 3]) &  # y1 < y2
         (boxes[:, 0] >= 0) &  # x1 >= 0
         (boxes[:, 1] >= 0) &  # y1 >= 0
-        (boxes[:, 4] >= 0)  # class >= 0
+        (box_areas > 0)
     )
     
     valid_indices = np.where(valid_mask)[0]
@@ -303,60 +93,106 @@ def visualize_batch_sample(image: np.ndarray,
     # Filter valid boxes
     valid_boxes, valid_indices = filter_valid_boxes(boxes)
     
-    # Convert image from normalized float32 [0, 1] to uint8 [0, 255]
-    # CRITICAL: Images from the dataset are normalized to [0, 1] range
-    # We need to clip and convert properly to avoid black images
-    if image.dtype == np.float32 or image.dtype == np.float64:
-        # Check if image is in [0, 1] range (normalized) or [0, 255] range
-        if image.max() <= 1.0:
-            # Normalized [0, 1] range - clip and convert
-            image_clipped = np.clip(image, 0.0, 1.0)
-            image_uint8 = (image_clipped * 255.0).astype(np.uint8)
-        else:
-            # Already in [0, 255] range (shouldn't happen, but handle it)
-            image_clipped = np.clip(image, 0.0, 255.0)
-            image_uint8 = image_clipped.astype(np.uint8)
-    else:
-        # Already integer type, but ensure it's in valid range
-        image_uint8 = np.clip(image, 0, 255).astype(np.uint8)
+    # CRITICAL: Convert image from normalized float32 [0, 1] to uint8 [0, 255] BEFORE drawing boxes
+    # Images from the dataset are now normalized to [0, 1] range at the end of preprocessing
+    # (after all augmentations), so they should always be in [0, 1] range.
+    # OpenCV drawing functions require uint8 images. Drawing on normalized images will result in dark/black images.
     
-    # Safety check: Verify image is not all black before proceeding
-    if image_uint8.max() == 0:
-        print(f"   ERROR: Image is completely black (all zeros)! This should not happen.")
+    # First, ensure we have a copy to avoid modifying the original
+    image_to_draw = image.copy()
+    
+    # Convert to uint8 - images should be in [0, 1] range after normalization
+    if image_to_draw.dtype == np.float32 or image_to_draw.dtype == np.float64:
+        # Images are normalized to [0, 1] - clip to ensure valid range and convert
+        image_clipped = np.clip(image_to_draw, 0.0, 1.0)
+        image_uint8 = (image_clipped * 255.0).astype(np.uint8)
+        
+        # Debug check: warn if values are outside expected range (shouldn't happen now)
+        img_max = float(image_to_draw.max())
+        img_min = float(image_to_draw.min())
+        if img_min < -0.01 or img_max > 1.01:
+            print(f"   WARNING: Image values outside [0, 1] range (min={img_min:.6f}, max={img_max:.6f})")
+            print(f"   This should not happen with the new normalization approach!")
+    else:
+        # Already integer type, but ensure it's in valid range and uint8
+        image_clipped = np.clip(image_to_draw, 0, 255)
+        image_uint8 = image_clipped.astype(np.uint8)
+    
+    # Safety check: Verify image is not all black or has very low values before proceeding
+    image_max_uint8 = image_uint8.max()
+    image_mean_uint8 = image_uint8.mean()
+    
+    if image_max_uint8 == 0:
+        print(f"   ERROR: Image is completely black (all zeros)!")
+        print(f"   Original image stats: min={image.min():.4f}, max={image.max():.4f}, mean={image.mean():.4f}")
+        print(f"   After conversion: max={image_max_uint8}, mean={image_mean_uint8:.2f}")
         # Create a placeholder image to avoid saving black image
         image_uint8 = np.ones_like(image_uint8) * 128  # Gray placeholder
+    elif image_mean_uint8 < 5.0:
+        # Very dark image - might indicate conversion issue
+        print(f"   WARNING: Image is very dark (mean={image_mean_uint8:.2f}, max={image_max_uint8})")
+        print(f"   Original image stats: min={image.min():.4f}, max={image.max():.4f}, mean={image.mean():.4f}")
     
     # Ensure image is in BGR format for OpenCV (draw_boxes expects BGR)
+    # TensorFlow loads images as RGB, so we need to convert to BGR for OpenCV
     if len(image_uint8.shape) == 3 and image_uint8.shape[2] == 3:
-        # Assume RGB, convert to BGR
+        # Convert RGB to BGR for OpenCV
         image_bgr = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2BGR)
     else:
         image_bgr = image_uint8.copy()
     
     # Prepare data for draw_boxes
+    # CRITICAL: Use class names (not indices) to catch mislabeling issues
     if len(valid_boxes) > 0:
         boxes_list = valid_boxes[:, :4].tolist()  # [x1, y1, x2, y2]
-        classes_list = valid_boxes[:, 4].astype(int).tolist()
+        # Extract class indices - ensure they're integers and within valid range
+        class_indices_raw = valid_boxes[:, 4]
+        class_indices = np.clip(class_indices_raw, 0, len(class_names) - 1).astype(np.int32)
+        
+        # Convert to class names for visualization (helps catch mislabeling)
+        # draw_boxes expects indices, but we validate them first
+        classes_list = class_indices.tolist()
         scores_list = [1.0] * len(valid_boxes)  # Dummy scores for visualization
+        
+        # Debug: Check for invalid or suspicious class indices
+        invalid_classes = class_indices_raw >= len(class_names)
+        clipped_classes = class_indices != class_indices_raw.astype(np.int32)
+        if np.any(invalid_classes) or np.any(clipped_classes):
+            if np.any(invalid_classes):
+                invalid_indices = class_indices_raw[invalid_classes]
+                print(f"   ERROR: Sample {sample_idx + 1} has invalid class indices: {invalid_indices}")
+                print(f"   Valid class range: [0, {len(class_names) - 1}]")
+            if np.any(clipped_classes):
+                clipped_indices = class_indices_raw[clipped_classes]
+                print(f"   WARNING: Sample {sample_idx + 1} has clipped class indices: {clipped_indices}")
+                print(f"   These were clipped to valid range [0, {len(class_names) - 1}]")
+            
+            # Show which class names are being used
+            unique_classes = np.unique(class_indices)
+            used_class_names = [class_names[int(c)] for c in unique_classes]
+            print(f"   Used class names in this sample: {used_class_names}")
     else:
         boxes_list = []
         classes_list = []
         scores_list = []
     
-    # Draw boxes
+    # Draw boxes on the uint8 BGR image (NOT on the normalized image)
+    # image_bgr is already converted to uint8 [0, 255] and BGR format
     image_with_boxes = image_bgr.copy()
     if len(boxes_list) > 0:
+        # draw_boxes expects indices, looks up class names internally
+        # This ensures class names are displayed correctly in visualization
         image_with_boxes = draw_boxes(
             image_with_boxes,
             boxes_list,
-            classes_list,
+            classes_list,  # Indices - draw_boxes will look up names
             scores_list,
-            class_names,
+            class_names,  # Pass class_names so draw_boxes can display them
             colors,
             show_score=False
         )
     
-    # Save visualization
+    # Save visualization (image_with_boxes is uint8 BGR, ready for cv2.imwrite)
     output_filename = f"batch_{batch_idx:04d}_sample_{sample_idx:04d}.png"
     output_path = output_dir / output_filename
     cv2.imwrite(str(output_path), image_with_boxes)
@@ -374,13 +210,16 @@ def visualize_batch_sample(image: np.ndarray,
     # Add box information
     for i, box in enumerate(valid_boxes):
         x1, y1, x2, y2, cls = box
-        class_name = class_names[int(cls)] if int(cls) < len(class_names) else f"class_{int(cls)}"
+        # Ensure class index is valid integer
+        cls_int = int(np.round(cls))
+        cls_int = max(0, min(cls_int, len(class_names) - 1))  # Clip to valid range
+        class_name = class_names[cls_int] if cls_int < len(class_names) else f"INVALID_CLASS_{cls_int}"
         metadata["boxes"].append({
             "x1": float(x1),
             "y1": float(y1),
             "x2": float(x2),
             "y2": float(y2),
-            "class_id": int(cls),
+            "class_id": cls_int,
             "class_name": class_name,
             "width": float(x2 - x1),
             "height": float(y2 - y1)
@@ -547,10 +386,9 @@ def main():
     )
     print("   Data generator created")
     
-    # Build visualization dataset
+    # Build visualization dataset using the actual training pipeline
     print("Building visualization dataset...")
-    dataset = build_visualization_dataset(
-        generator,
+    dataset = generator.build_visualization_dataset(
         prefetch_buffer_size=tf.data.AUTOTUNE,
         num_parallel_calls=tf.data.AUTOTUNE,
         shuffle_buffer_size=4096,
@@ -587,12 +425,19 @@ def main():
                 image = batch_images_np[sample_idx]
                 boxes = batch_boxes_np[sample_idx]
                 
-                # Debug: Check image statistics to catch black images early
-                image_min = image.min()
-                image_max = image.max()
-                image_mean = image.mean()
+                # Debug: Check image statistics to catch issues early
+                image_min = float(image.min())
+                image_max = float(image.max())
+                image_mean = float(image.mean())
+                image_dtype = image.dtype
+                
+                # Check for problematic images before conversion
                 if image_max < 0.01 or image_mean < 0.001:
-                    print(f"   WARNING: Sample {sample_idx + 1} appears to be black (min={image_min:.4f}, max={image_max:.4f}, mean={image_mean:.4f})")
+                    print(f"   WARNING: Sample {sample_idx + 1} appears to be black/dark before conversion")
+                    print(f"   Stats: dtype={image_dtype}, min={image_min:.6f}, max={image_max:.6f}, mean={image_mean:.6f}")
+                elif image_min < -0.5 or image_max > 2.0:
+                    print(f"   INFO: Sample {sample_idx + 1} has values outside [0, 1] (likely from augmentations)")
+                    print(f"   Stats: dtype={image_dtype}, min={image_min:.6f}, max={image_max:.6f}, mean={image_mean:.6f}")
                 
                 # Visualize sample
                 metadata = visualize_batch_sample(

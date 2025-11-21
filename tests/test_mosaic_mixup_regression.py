@@ -26,9 +26,11 @@ import cv2
 import matplotlib.pyplot as plt
 from typing import List, Tuple
 
-# Add project root to path
+# Add project root and tests directory to path
 project_root = Path(__file__).parent.parent
+tests_dir = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(tests_dir))
 
 from multigriddet.data.generators import (
     tf_load_and_decode_image,
@@ -39,48 +41,11 @@ from multigriddet.data.generators import (
     tf_random_mixup
 )
 from multigriddet.data.utils import load_annotation_lines
-
-
-def draw_boxes_on_image(image: np.ndarray, boxes: np.ndarray, 
-                        color: Tuple[int, int, int] = (0, 255, 0),
-                        thickness: int = 2) -> np.ndarray:
-    """Draw bounding boxes on image."""
-    if image.dtype == np.float32 or image.dtype == np.float64:
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
-    
-    image_copy = image.copy()
-    
-    for box in boxes:
-        x1, y1, x2, y2, cls = box
-        # Skip invalid boxes (all zeros)
-        if x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0:
-            continue
-        
-        # Ensure coordinates are integers and within image bounds
-        x1 = int(np.clip(x1, 0, image_copy.shape[1] - 1))
-        y1 = int(np.clip(y1, 0, image_copy.shape[0] - 1))
-        x2 = int(np.clip(x2, 0, image_copy.shape[1] - 1))
-        y2 = int(np.clip(y2, 0, image_copy.shape[0] - 1))
-        
-        # Skip if box is invalid after clipping
-        if x2 <= x1 or y2 <= y1:
-            continue
-        
-        # Draw rectangle
-        cv2.rectangle(image_copy, (x1, y1), (x2, y2), color, thickness)
-        
-        # Draw class label
-        label = f"cls:{int(cls)}"
-        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image_copy, (x1, y1 - text_height - 4), 
-                     (x1 + text_width, y1), color, -1)
-        cv2.putText(image_copy, label, (x1, y1 - 2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    return image_copy
+from test_utils import (
+    convert_image_to_uint8,
+    draw_boxes_with_class_names,
+    load_class_names_from_config,
+)
 
 
 def count_valid_boxes(boxes: np.ndarray) -> int:
@@ -102,6 +67,8 @@ def test_mosaic_box_preservation(annotation_lines: List[str],
                                  input_shape: Tuple[int, int],
                                  num_tests: int,
                                  output_dir: str,
+                                 class_names: List[str],
+                                 colors: List[Tuple[int, int, int]],
                                  seed: int = 42):
     """
     Test Mosaic augmentation preserves all boxes from 4 source images.
@@ -235,13 +202,20 @@ def test_mosaic_box_preservation(annotation_lines: List[str],
             # This is actually OK if we have that many boxes, but worth noting
         
         # Visual verification - convert image from normalized [0,1] to uint8 [0,255]
-        mosaic_image_uint8 = (np.clip(mosaic_image, 0, 1) * 255).astype(np.uint8)
-        mosaic_image_vis = draw_boxes_on_image(mosaic_image_uint8, mosaic_boxes_result, color=(0, 255, 0))
+        mosaic_image_uint8 = convert_image_to_uint8(mosaic_image)
+        mosaic_with_boxes_bgr = draw_boxes_with_class_names(
+            mosaic_image_uint8,
+            mosaic_boxes_result,
+            class_names,
+            colors,
+            show_score=False,
+        )
+        mosaic_with_boxes_rgb = cv2.cvtColor(mosaic_with_boxes_bgr, cv2.COLOR_BGR2RGB)
         
         # Save visualization
         output_path = os.path.join(output_dir, f"mosaic_test_{test_idx + 1:03d}.png")
         plt.figure(figsize=(12, 12))
-        plt.imshow(mosaic_image_vis)
+        plt.imshow(mosaic_with_boxes_rgb)
         plt.title(f"Mosaic Test {test_idx + 1}\nSource boxes: {total_source_boxes}, "
                  f"After Mosaic: {valid_after}, Expected min: {expected_minimum}")
         plt.axis('off')
@@ -265,6 +239,8 @@ def test_mixup_box_preservation(annotation_lines: List[str],
                                 input_shape: Tuple[int, int],
                                 num_tests: int,
                                 output_dir: str,
+                                class_names: List[str],
+                                colors: List[Tuple[int, int, int]],
                                 seed: int = 42):
     """
     Test MixUp augmentation preserves all boxes from 2 source images.
@@ -395,13 +371,20 @@ def test_mixup_box_preservation(annotation_lines: List[str],
             all_passed = False
         
         # Visual verification - convert image from normalized [0,1] to uint8 [0,255]
-        mixup_image_uint8 = (np.clip(mixup_image, 0, 1) * 255).astype(np.uint8)
-        mixup_image_vis = draw_boxes_on_image(mixup_image_uint8, mixup_boxes_result, color=(0, 255, 0))
+        mixup_image_uint8 = convert_image_to_uint8(mixup_image)
+        mixup_with_boxes_bgr = draw_boxes_with_class_names(
+            mixup_image_uint8,
+            mixup_boxes_result,
+            class_names,
+            colors,
+            show_score=False,
+        )
+        mixup_with_boxes_rgb = cv2.cvtColor(mixup_with_boxes_bgr, cv2.COLOR_BGR2RGB)
         
         # Save visualization
         output_path = os.path.join(output_dir, f"mixup_test_{test_idx + 1:03d}.png")
         plt.figure(figsize=(12, 12))
-        plt.imshow(mixup_image_vis)
+        plt.imshow(mixup_with_boxes_rgb)
         plt.title(f"MixUp Test {test_idx + 1}\nSource boxes: {total_source_boxes}, "
                  f"After MixUp: {valid_after}")
         plt.axis('off')
@@ -425,6 +408,8 @@ def main():
     parser = argparse.ArgumentParser(description='Regression tests for Mosaic/MixUp box preservation')
     parser.add_argument('--annotation', type=str, required=True,
                        help='Path to annotation file')
+    parser.add_argument('--config', type=str, required=True,
+                       help='Path to training config YAML file (for class names/colors)')
     parser.add_argument('--input-shape', type=int, nargs=2, default=[640, 640],
                        help='Input image shape (height width)')
     parser.add_argument('--num-tests', type=int, default=5,
@@ -443,16 +428,23 @@ def main():
     annotation_lines = load_annotation_lines(args.annotation, shuffle=False)
     print(f"Loaded {len(annotation_lines)} annotation lines")
     
+    # Load class names and colors from config for visualization
+    print(f"Loading classes from config: {args.config}")
+    class_names, colors = load_class_names_from_config(args.config)
+    print(f"Loaded {len(class_names)} classes")
+    
     # Test Mosaic
     mosaic_output_dir = os.path.join(args.output_dir, 'mosaic')
     test_mosaic_box_preservation(
-        annotation_lines, input_shape, args.num_tests, mosaic_output_dir, args.seed
+        annotation_lines, input_shape, args.num_tests, mosaic_output_dir,
+        class_names, colors, args.seed
     )
     
     # Test MixUp
     mixup_output_dir = os.path.join(args.output_dir, 'mixup')
     test_mixup_box_preservation(
-        annotation_lines, input_shape, args.num_tests, mixup_output_dir, args.seed
+        annotation_lines, input_shape, args.num_tests, mixup_output_dir,
+        class_names, colors, args.seed
     )
     
     print("\nRegression tests completed!")

@@ -1,114 +1,51 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Comprehensive regression test suite for data augmentation pipelines.
+Regression test suite for data augmentation pipelines.
 
-This module provides automated testing and visual verification for all augmentations
-that affect bounding box coordinates. Each augmentation is tested independently to
-ensure correct coordinate transformations and box alignment.
+Tests augmentations independently to verify correct coordinate transformations.
+Each augmentation is tested with visual verification of box alignment.
 
 Tested Augmentations:
     - Horizontal Flip: Mirrors images and boxes horizontally
-    - Rotation: Applies 90/180/270 degree rotations with box transformations
-    - Random Resize Crop Pad: Scales, crops, and pads images with coordinate adjustments
-    - GridMask: Applies grid-based masking (may filter boxes if too small)
-    - MixUp: Batch-level augmentation that blends two images and concatenates boxes
+    - Rotation: 90/180/270 degree rotations with box transformations
+    - Random Resize Crop Pad: Scales, crops, and pads with coordinate adjustments
+    - GridMask: Grid-based masking (may filter boxes if too small)
+    - MixUp: Batch-level augmentation blending two images
     - Color Augmentations: Brightness, contrast, saturation, hue, grayscale
-        (tested for completeness; should not affect box coordinates)
 
-Usage Examples:
-    # Test all augmentations
-    python tests/test_augmentations.py --annotation data/coco_train2017.txt --num-tests 3
-
-    # Test specific augmentation
+Usage:
     python tests/test_augmentations.py --annotation data/coco_train2017.txt \\
-        --aug horizontal_flip --num-tests 5
-
-    # Custom configuration
-    python tests/test_augmentations.py --annotation data/coco_train2017.txt \\
-        --aug all --num-tests 5 --seed 42 --input-shape 640 640
-
-Output:
-    Generates side-by-side visualizations (original vs augmented) for manual inspection.
-    Visualizations are saved to tests/augmentation_test_outputs/{aug_name}/
-
-Author:
-    MultiGridDet Project
+        --config configs/train_config.yaml --aug all --num-tests 3
 """
 
-import argparse
 import sys
-import os
 from pathlib import Path
+import argparse
 import numpy as np
 import tensorflow as tf
 import cv2
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 
-# Add project root to path
+# Enable eager execution for .numpy() calls
+tf.config.run_functions_eagerly(True)
+
+# Add project root and tests directory to path
 project_root = Path(__file__).parent.parent
+tests_dir = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(tests_dir))
 
 from multigriddet.data.generators import (
-    tf_load_and_decode_image,
-    tf_parse_boxes,
-    tf_letterbox_resize,
-    tf_random_horizontal_flip,
-    tf_random_rotate,
-    tf_random_resize_crop_pad,
-    tf_random_gridmask,
-    tf_random_mixup,
-    tf_random_brightness,
-    tf_random_contrast,
-    tf_random_saturation,
-    tf_random_hue,
-    tf_random_grayscale
+    tf_load_and_decode_image, tf_parse_boxes, tf_letterbox_resize,
+    tf_random_horizontal_flip, tf_random_rotate, tf_random_resize_crop_pad,
+    tf_random_gridmask, tf_random_mixup, tf_random_brightness, tf_random_contrast,
+    tf_random_saturation, tf_random_hue, tf_random_grayscale
 )
-from multigriddet.data.utils import load_annotation_lines
+from multigriddet.data.utils import load_annotation_lines, get_classes, get_colors
+from test_utils import convert_image_to_uint8, draw_boxes_with_class_names
 
 
-def draw_boxes_on_image(image: np.ndarray, boxes: np.ndarray, 
-                        color: Tuple[int, int, int] = (0, 255, 0),
-                        thickness: int = 2) -> np.ndarray:
-    """Draw bounding boxes on image."""
-    # Convert image to uint8 if needed
-    if image.dtype == np.float32 or image.dtype == np.float64:
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
-    
-    image_copy = image.copy()
-    
-    for box in boxes:
-        x1, y1, x2, y2, cls = box
-        # Skip invalid boxes
-        if x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0:
-            continue
-        
-        # Ensure coordinates are integers and within image bounds
-        x1 = int(np.clip(x1, 0, image_copy.shape[1] - 1))
-        y1 = int(np.clip(y1, 0, image_copy.shape[0] - 1))
-        x2 = int(np.clip(x2, 0, image_copy.shape[1] - 1))
-        y2 = int(np.clip(y2, 0, image_copy.shape[0] - 1))
-        
-        # Skip if box is invalid after clipping
-        if x2 <= x1 or y2 <= y1:
-            continue
-        
-        # Draw rectangle
-        cv2.rectangle(image_copy, (x1, y1), (x2, y2), color, thickness)
-        
-        # Draw class label
-        label = f"cls:{int(cls)}"
-        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image_copy, (x1, y1 - text_height - 4), 
-                     (x1 + text_width, y1), color, -1)
-        cv2.putText(image_copy, label, (x1, y1 - 2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    return image_copy
 
 
 def create_side_by_side_visualization(original_image: np.ndarray, 
@@ -116,65 +53,36 @@ def create_side_by_side_visualization(original_image: np.ndarray,
                                       original_boxes: np.ndarray,
                                       augmented_boxes: np.ndarray,
                                       aug_name: str,
-                                      output_path: str):
-    """
-    Create a side-by-side visualization comparing original and augmented images.
-    
-    Args:
-        original_image: Original image array (H, W, 3) in uint8 format
-        augmented_image: Augmented image array (H, W, 3) in uint8 format
-        original_boxes: Original bounding boxes (N, 5) in format (x1, y1, x2, y2, class)
-        augmented_boxes: Augmented bounding boxes (M, 5) in format (x1, y1, x2, y2, class)
-        aug_name: Name of the augmentation applied (for title)
-        output_path: File path to save the visualization
-        
-    Note:
-        Images are converted from RGB to BGR for OpenCV drawing, then back to RGB
-        for matplotlib display. Original boxes are drawn in green, augmented boxes in red.
-    """
+                                      output_path: str,
+                                      class_names: List[str],
+                                      colors: List[Tuple[int, int, int]]):
+    """Create side-by-side visualization comparing original and augmented images."""
     fig, axes = plt.subplots(1, 2, figsize=(20, 10))
     
-    # Ensure images are in uint8 format and RGB
-    if original_image.dtype != np.uint8:
-        if original_image.max() <= 1.0:
-            original_image = (original_image * 255.0).astype(np.uint8)
-        else:
-            original_image = original_image.astype(np.uint8)
+    original_image = convert_image_to_uint8(original_image)
+    augmented_image = convert_image_to_uint8(augmented_image)
     
-    if augmented_image.dtype != np.uint8:
-        if augmented_image.max() <= 1.0:
-            augmented_image = (augmented_image * 255.0).astype(np.uint8)
-        else:
-            augmented_image = augmented_image.astype(np.uint8)
-    
-    # TensorFlow images are in RGB format, but draw_boxes_on_image expects BGR (OpenCV)
-    # So we need to convert RGB -> BGR for drawing, then BGR -> RGB for matplotlib
-    
-    # Original image: Convert RGB to BGR for OpenCV drawing
     if len(original_image.shape) == 3 and original_image.shape[2] == 3:
-        orig_bgr = cv2.cvtColor(original_image, cv2.COLOR_RGB2BGR)
+        orig_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
     else:
-        orig_bgr = original_image
+        orig_rgb = original_image
     
-    # Original image with boxes (draw_boxes_on_image uses OpenCV/BGR)
-    orig_with_boxes = draw_boxes_on_image(orig_bgr, original_boxes, 
-                                         color=(0, 255, 0), thickness=2)
-    # Convert back to RGB for matplotlib display
+    orig_with_boxes = draw_boxes_with_class_names(
+        orig_rgb, original_boxes, class_names, colors, show_score=False
+    )
     orig_with_boxes_rgb = cv2.cvtColor(orig_with_boxes, cv2.COLOR_BGR2RGB)
     axes[0].imshow(orig_with_boxes_rgb)
     axes[0].set_title(f'Original ({len(original_boxes)} boxes)', fontsize=14, fontweight='bold')
     axes[0].axis('off')
     
-    # Augmented image: TensorFlow operations return RGB, convert to BGR for OpenCV drawing
     if len(augmented_image.shape) == 3 and augmented_image.shape[2] == 3:
-        aug_bgr = cv2.cvtColor(augmented_image, cv2.COLOR_RGB2BGR)
+        aug_rgb = cv2.cvtColor(augmented_image, cv2.COLOR_BGR2RGB)
     else:
-        aug_bgr = augmented_image
+        aug_rgb = augmented_image
     
-    # Augmented image with boxes (draw_boxes_on_image uses OpenCV/BGR)
-    aug_with_boxes = draw_boxes_on_image(aug_bgr, augmented_boxes,
-                                        color=(255, 0, 0), thickness=2)
-    # Convert back to RGB for matplotlib display
+    aug_with_boxes = draw_boxes_with_class_names(
+        aug_rgb, augmented_boxes, class_names, colors, show_score=False
+    )
     aug_with_boxes_rgb = cv2.cvtColor(aug_with_boxes, cv2.COLOR_BGR2RGB)
     axes[1].imshow(aug_with_boxes_rgb)
     axes[1].set_title(f'{aug_name} ({len(augmented_boxes)} boxes)', fontsize=14, fontweight='bold')
@@ -248,12 +156,14 @@ def test_rotation(image: tf.Tensor, boxes: tf.Tensor,
     new_y2 = width - x1
     rotated_boxes = tf.concat([new_x1, new_y1, new_x2, new_y2, cls], axis=-1)
     
-    # Clip boxes to image boundaries
-    rotated_boxes = tf.clip_by_value(
-        rotated_boxes,
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [width, height, width, height, tf.cast(tf.shape(boxes)[0], tf.float32)]
+    boxes_coords = rotated_boxes[:, :4]
+    boxes_classes = rotated_boxes[:, 4:5]
+    boxes_coords_clipped = tf.clip_by_value(
+        boxes_coords,
+        [0.0, 0.0, 0.0, 0.0],
+        [width, height, width, height]
     )
+    rotated_boxes = tf.concat([boxes_coords_clipped, boxes_classes], axis=1)
     
     return rotated_image.numpy(), rotated_boxes.numpy()
 
@@ -375,7 +285,8 @@ def test_mixup(images: tf.Tensor, boxes: tf.Tensor,
 
 def test_augmentation(aug_name: str, annotation_lines: List[str], 
                      input_shape: Tuple[int, int], num_tests: int,
-                     output_dir: str, seed: int = 42):
+                     output_dir: str, class_names: List[str],
+                     colors: List[Tuple[int, int, int]], seed: int = 42):
     """Test a specific augmentation."""
     
     # Filter annotation lines that have boxes
@@ -399,8 +310,7 @@ def test_augmentation(aug_name: str, annotation_lines: List[str],
     print(f"Found {len(valid_lines)} valid annotation lines with boxes")
     print()
     
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # Select augmentation function
     aug_functions = {
@@ -595,13 +505,14 @@ def test_augmentation(aug_name: str, annotation_lines: List[str],
             print(f"   Original boxes: {len(boxes_orig_valid)}")
             print(f"   Augmented boxes: {len(boxes_aug_valid)}")
             
-            # Create visualization
-            output_path = os.path.join(output_dir, f"{aug_name}_test_{test_idx + 1:03d}.png")
+            output_path = Path(output_dir) / f"{aug_name}_test_{test_idx + 1:03d}.png"
             create_side_by_side_visualization(
                 orig_image_np, aug_image_np,
                 boxes_orig_valid, boxes_aug_valid,
                 aug_name.replace('_', ' ').title(),
-                output_path
+                str(output_path),
+                class_names,
+                colors
             )
             
             print(f"   Saved visualization to: {output_path}")
@@ -639,6 +550,8 @@ def main():
     )
     parser.add_argument('--annotation', type=str, required=True,
                        help='Path to annotation file')
+    parser.add_argument('--config', type=str, required=True,
+                       help='Path to training config YAML file')
     parser.add_argument('--aug', type=str, default='all',
                        choices=['all', 'horizontal_flip', 'rotation', 'resize_crop_pad', 
                                'gridmask', 'mixup', 'color'],
@@ -655,7 +568,24 @@ def main():
     
     args = parser.parse_args()
     
-    # Load annotations
+    from multigriddet.config import ConfigLoader
+    config = ConfigLoader.load_config(args.config)
+    data_config = config.get('data', {})
+    classes_path = data_config.get('classes_path')
+    if not classes_path:
+        model_config_path = config.get('model_config')
+        if model_config_path:
+            model_config = ConfigLoader.load_config(model_config_path)
+            classes_path = model_config.get('model', {}).get('preset', {}).get('classes_path')
+    
+    if not classes_path:
+        raise ValueError("classes_path not found in config")
+    
+    print(f"Loading classes from: {classes_path}")
+    class_names = get_classes(classes_path)
+    colors = get_colors(len(class_names))
+    print(f"Loaded {len(class_names)} classes")
+    
     print(f"Loading annotations from: {args.annotation}")
     annotation_lines = load_annotation_lines(args.annotation)
     print(f"Loaded {len(annotation_lines)} annotation lines")
@@ -668,12 +598,12 @@ def main():
     else:
         augmentations = [args.aug]
     
-    # Test each augmentation
     for aug_name in augmentations:
-        aug_output_dir = os.path.join(args.output_dir, aug_name)
+        aug_output_dir = Path(args.output_dir) / aug_name
+        aug_output_dir.mkdir(parents=True, exist_ok=True)
         test_augmentation(
             aug_name, annotation_lines, input_shape,
-            args.num_tests, aug_output_dir, args.seed
+            args.num_tests, str(aug_output_dir), class_names, colors, args.seed
         )
     
     print("\n" + "=" * 80)
