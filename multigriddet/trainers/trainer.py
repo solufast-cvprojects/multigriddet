@@ -16,7 +16,7 @@ from typing import Dict, Any, Optional
 
 from ..config import ConfigLoader, build_model_for_training
 from ..utils.anchors import load_anchors, load_classes
-from ..utils.tf_optimization import optimize_tf_gpu
+from ..utils.tf_optimization import optimize_tf_gpu, configure_mixed_precision
 from ..data import MultiGridDataGenerator, load_annotation_lines
 
 
@@ -119,7 +119,16 @@ class MultiGridTrainer:
         self.use_tf_dataset = True  # Default to using tf.data.Dataset
         self.callbacks = []
         
-        # Initialize TensorFlow optimizations
+        # Optional mixed precision / AMP configuration (for modern GPUs like A100)
+        env_config = self.config.get('environment', {})
+        if env_config.get('mixed_precision', False):
+            policy = env_config.get('mixed_precision_policy', 'mixed_float16')
+            try:
+                configure_mixed_precision(policy=policy)
+            except Exception as e:
+                print(f"[WARNING] Mixed precision configuration failed ({policy}): {e}")
+        
+        # Initialize basic TensorFlow GPU optimizations
         optimize_tf_gpu()
         
         # Load model configuration

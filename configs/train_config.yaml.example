@@ -7,6 +7,12 @@ data:
   val_annotation: data/coco_val2017.txt
   classes_path: configs/coco_classes.txt
 
+# TensorFlow / GPU optimization (optional)
+# Uncomment to enable mixed precision on supported GPUs (e.g., A100)
+# environment:
+#   mixed_precision: true
+#   mixed_precision_policy: mixed_float16  # Options: mixed_float16, mixed_bfloat16
+
 # Data loader configuration (for GPU optimization)
 data_loader:
   use_tf_dataset: true          # Use tf.data.Dataset for better GPU utilization (recommended)
