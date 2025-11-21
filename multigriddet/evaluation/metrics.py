@@ -12,6 +12,19 @@ from tqdm import tqdm
 from ..utils.boxes import BoxUtils
 
 
+def _get_safe_num_workers(num_tasks: int) -> int:
+    """
+    Determine a safe number of worker processes for multiprocessing.
+    
+    Caps the number of workers to avoid excessive memory usage on machines
+    with many CPU cores, while still providing useful parallelism.
+    """
+    if num_tasks <= 0:
+        return 1
+    # Hard cap to keep memory usage under control on very wide machines.
+    return max(1, min(cpu_count(), num_tasks, 8))
+
+
 def calculate_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
     """
     Calculate IoU matrix between two sets of boxes using vectorized operations.
@@ -523,72 +536,90 @@ def calculate_map(predictions: List[Dict],
     total_tasks = len(active_classes) * len(iou_thresholds)
     
     if use_parallel and len(active_classes) > 1:
-        # Parallel processing for multiple classes
-        print(f"🚀 Using parallel processing with {min(cpu_count(), len(active_classes))} cores...")
-        
-        # For large datasets, disable IoU caching as it becomes too expensive
-        num_predictions = len(predictions)
-        if cache_ious and num_predictions > 10000:
-            print(f"⚠️  Large dataset detected ({num_predictions} predictions). Disabling IoU caching for performance.")
-            cache_ious = False
-        
-        if cache_ious:
-            # Parallel processing with IoU caching (only for small datasets)
-            print("🔄 Computing IoU caches for all classes...")
-            iou_caches = {}
-            for class_id in active_classes:
-                print(f"   Computing cache for class {class_id}...")
-                iou_caches[class_id] = compute_iou_cache_for_class(predictions, ground_truths, class_id)
+        try:
+            # Parallel processing for multiple classes
+            num_workers = _get_safe_num_workers(len(active_classes))
+            print(f"🚀 Using parallel processing with {num_workers} cores...")
             
-            # Create tasks for parallel processing with cached IoU
-            tasks = []
+            # For large datasets, disable IoU caching as it becomes too expensive
+            num_predictions = len(predictions)
+            if cache_ious and num_predictions > 10000:
+                print(f"⚠️  Large dataset detected ({num_predictions} predictions). Disabling IoU caching for performance.")
+                cache_ious = False
+            
+            if cache_ious:
+                # Parallel processing with IoU caching (only for small datasets)
+                print("🔄 Computing IoU caches for all classes...")
+                iou_caches = {}
+                for class_id in active_classes:
+                    print(f"   Computing cache for class {class_id}...")
+                    iou_caches[class_id] = compute_iou_cache_for_class(predictions, ground_truths, class_id)
+                
+                # Create tasks for parallel processing with cached IoU
+                tasks = []
+                for class_id in active_classes:
+                    for iou_threshold in iou_thresholds:
+                        tasks.append((predictions, ground_truths, class_id, iou_threshold, iou_caches[class_id], method))
+                
+                # Process in parallel with cached IoU
+                print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
+                with Pool(processes=_get_safe_num_workers(len(tasks))) as pool:
+                    ap_results = list(tqdm(
+                        pool.imap(_calculate_ap_worker_cached, tasks),
+                        total=len(tasks),
+                        desc="   Computing AP",
+                        unit="task"
+                    ))
+            else:
+                # Parallel processing without caching (faster for large datasets)
+                print("⚡ Using optimized parallel processing (no IoU caching)...")
+                tasks = []
+                for class_id in active_classes:
+                    for iou_threshold in iou_thresholds:
+                        tasks.append((predictions, ground_truths, class_id, iou_threshold, method))
+                
+                # Process in parallel
+                print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
+                with Pool(processes=_get_safe_num_workers(len(tasks))) as pool:
+                    ap_results = list(tqdm(
+                        pool.imap(_calculate_ap_worker, tasks),
+                        total=len(tasks),
+                        desc="   Computing AP",
+                        unit="task"
+                    ))
+            
+            # Organize results
+            result_idx = 0
             for class_id in active_classes:
+                class_name = class_names[class_id] if class_id < len(class_names) else f'class_{class_id}'
+                class_ap_results = {}
+                
                 for iou_threshold in iou_thresholds:
-                    tasks.append((predictions, ground_truths, class_id, iou_threshold, iou_caches[class_id], method))
-            
-            # Process in parallel with cached IoU
-            print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
-            with Pool(processes=min(cpu_count(), len(tasks))) as pool:
-                ap_results = list(tqdm(
-                    pool.imap(_calculate_ap_worker_cached, tasks),
-                    total=len(tasks),
-                    desc="   Computing AP",
-                    unit="task"
-                ))
-        else:
-            # Parallel processing without caching (faster for large datasets)
-            print("⚡ Using optimized parallel processing (no IoU caching)...")
-            tasks = []
-            for class_id in active_classes:
-                for iou_threshold in iou_thresholds:
-                    tasks.append((predictions, ground_truths, class_id, iou_threshold, method))
-            
-            # Process in parallel
-            print(f"   Processing {len(tasks)} tasks (classes × IoU thresholds)...")
-            with Pool(processes=min(cpu_count(), len(tasks))) as pool:
-                ap_results = list(tqdm(
-                    pool.imap(_calculate_ap_worker, tasks),
-                    total=len(tasks),
-                    desc="   Computing AP",
-                    unit="task"
-                ))
-        
-        # Organize results
-        result_idx = 0
-        for class_id in active_classes:
-            class_name = class_names[class_id] if class_id < len(class_names) else f'class_{class_id}'
-            class_ap_results = {}
-            
-            for iou_threshold in iou_thresholds:
-                ap = ap_results[result_idx]
-                class_ap_results[f'AP{iou_threshold:.2f}'] = ap
-                iou_aps[iou_threshold].append(ap)
-                result_idx += 1
-            
-            # Average AP across IoU thresholds for this class
-            class_ap_avg = np.mean(list(class_ap_results.values()))
-            class_ap_results['AP'] = class_ap_avg
-            class_aps[class_name] = class_ap_results
+                    ap = ap_results[result_idx]
+                    class_ap_results[f'AP{iou_threshold:.2f}'] = ap
+                    iou_aps[iou_threshold].append(ap)
+                    result_idx += 1
+                
+                # Average AP across IoU thresholds for this class
+                class_ap_avg = np.mean(list(class_ap_results.values()))
+                class_ap_results['AP'] = class_ap_avg
+                class_aps[class_name] = class_ap_results
+        except OSError as e:
+            # If the system cannot allocate memory for worker processes, fall back
+            # to a safe sequential evaluation path instead of crashing.
+            print(f"[WARNING] Parallel mAP evaluation failed: {e}")
+            print("          Falling back to sequential evaluation without multiprocessing.")
+            return calculate_map(
+                predictions=predictions,
+                ground_truths=ground_truths,
+                num_classes=num_classes,
+                iou_thresholds=iou_thresholds,
+                class_names=class_names,
+                method=method,
+                use_parallel=False,
+                optimize_classes=optimize_classes,
+                cache_ious=False,
+            )
     else:
         # Sequential processing (fallback or single class)
         print(f"   Processing {len(active_classes)} classes sequentially...")

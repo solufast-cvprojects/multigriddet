@@ -55,20 +55,46 @@ class MultiGridDecoder:
         Returns:
             Decoded predictions tensor of shape (batch, num_boxes, 5 + num_classes)
         """
+        """
+        Robustly decode predictions from all scales, handling any empty or
+        inconsistent tensors that may appear due to upstream issues.
+        """
         if len(predictions) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} predictions, got {len(predictions)}")
         
         results = []
-        
+        batch_size: Optional[int] = None
+        features = 5 + self.num_classes
+
         for i, prediction in enumerate(predictions):
+            # Skip completely empty predictions for this scale
+            if prediction is None or prediction.size == 0 or prediction.shape[0] == 0:
+                continue
+
             decoded = self._decode_single_scale(
-                prediction, 
-                self.anchors[i], 
+                prediction,
+                self.anchors[i],
                 i
             )
+
+            # Initialize or check batch size consistency
+            if batch_size is None:
+                batch_size = decoded.shape[0]
+            elif decoded.shape[0] != batch_size:
+                # Skip inconsistent scale instead of crashing; this should not
+                # normally happen, but avoids runtime errors in edge cases.
+                continue
+
             results.append(decoded)
         
-        # Concatenate results from all scales
+        # If everything was skipped, return an empty prediction tensor that
+        # downstream code can safely handle.
+        if not results:
+            # Use batch_size if it could be inferred, otherwise fall back to 0.
+            inferred_batch = batch_size if batch_size is not None else 0
+            return np.zeros((inferred_batch, 0, features), dtype="float32")
+
+        # Concatenate results from all valid scales
         return np.concatenate(results, axis=1)
     
     def _decode_single_scale(self, prediction: np.ndarray, 
