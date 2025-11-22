@@ -129,6 +129,11 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     'no_object_scale': loss_config.get('no_object_scale', 1.0),
                     'class_scale': loss_config.get('class_scale', 1.0),
                     'anchor_scale': loss_config.get('anchor_scale', 1.0),
+                    'use_iou_aware_objectness': loss_config.get('use_iou_aware_objectness', False),
+                    'iou_objectness_power': loss_config.get('iou_objectness_power', 1.0),
+                    'iou_objectness_ratio': loss_config.get('iou_objectness_ratio', 1.0),
+                    'trainable_nms_weight': loss_config.get('trainable_nms_weight', 0.0),
+                    'trainable_nms_power': loss_config.get('trainable_nms_power', 2.0),
                 }
             
             # Extract loss normalization configuration
@@ -314,4 +319,3 @@ def get_model_info(config: Dict[str, Any]) -> Dict[str, Any]:
         })
     
     return info
-

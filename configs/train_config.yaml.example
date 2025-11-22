@@ -61,6 +61,11 @@ training:
     no_object_scale: 0.5   # Scale for objectness loss (negative cells) - lower to reduce negative cell dominance
     class_scale: 1.0       # Scale for classification loss
     anchor_scale: 1.0      # Scale for anchor prediction loss
+    use_iou_aware_objectness: false   # Enable to let objectness follow IoU (trainable NMS)
+    iou_objectness_power: 1.5         # >1 squeezes confidence on imperfect boxes
+    iou_objectness_ratio: 1.0         # Blend between IoU target (1.0) and binary target (0.0)
+    trainable_nms_weight: 0.0         # Extra penalty for ignore regions (0 disables)
+    trainable_nms_power: 2.0          # Controls how strongly IoU scales the ignore penalty
 
   # Loss normalization strategy
   # Controls how loss values are normalized to ensure stable training and comparable metrics

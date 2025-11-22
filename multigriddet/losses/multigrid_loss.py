@@ -56,7 +56,12 @@ class MultiGridLoss:
                  class_scale: float = 1.0,
                  anchor_scale: float = 1.0,
                  class_weights: Optional[np.ndarray] = None,
-                 loss_normalization: Optional[List[str]] = None):
+                 loss_normalization: Optional[List[str]] = None,
+                 use_iou_aware_objectness: bool = False,
+                 iou_objectness_power: float = 1.0,
+                 iou_objectness_ratio: float = 1.0,
+                 trainable_nms_weight: float = 0.0,
+                 trainable_nms_power: float = 2.0):
         """
         Initialize MultiGridDet loss.
         
@@ -88,6 +93,11 @@ class MultiGridLoss:
                               - "batch": Normalize by batch size (default, recommended)
                               - "grid": Normalize by batch_size * grid_h * grid_w
                               Default: ["batch"] for consistent loss scaling
+            use_iou_aware_objectness: If True, positives use IoU-aware targets for objectness (acts like trainable NMS)
+            iou_objectness_power: Exponent applied to IoU target (higher = harsher suppression of low-IoU boxes)
+            iou_objectness_ratio: Blend factor between IoU target and binary (1.0 = pure IoU, 0.0 = legacy target)
+            trainable_nms_weight: Additional weight applied to ignore regions to push duplicates down
+            trainable_nms_power: Exponent for scaling the ignore penalty by IoU (higher = focus on high-overlap dupes)
         """
         self.anchors = anchors
         self.num_classes = num_classes
@@ -109,6 +119,12 @@ class MultiGridLoss:
         self.no_object_scale = no_object_scale
         self.class_scale = class_scale
         self.anchor_scale = anchor_scale
+        self.use_iou_aware_objectness = use_iou_aware_objectness
+        self.iou_objectness_power = iou_objectness_power
+        # Clamp ratio between 0 and 1 to avoid invalid blends
+        self.iou_objectness_ratio = float(np.clip(iou_objectness_ratio, 0.0, 1.0))
+        self.trainable_nms_weight = float(trainable_nms_weight)
+        self.trainable_nms_power = trainable_nms_power
         
         # Loss normalization configuration
         if loss_normalization is None:
@@ -264,7 +280,7 @@ class MultiGridLoss:
             
             # Compute ignore mask for all loss options
             # Ignore mask prevents objectness/anchor loss on cells with high IoU but not assigned as positive
-            ignore_mask = self._compute_ignore_mask(
+            ignore_mask, assigned_anchor_iou, max_iou_map = self._compute_ignore_mask(
                 pred_xy, pred_wh, true_xy, true_wh,
                 anchor_layer, object_mask, y_true_layer, grid_shape
             )
@@ -325,7 +341,9 @@ class MultiGridLoss:
             # Objectness loss: predicts if object exists in grid cell (sigmoid BCE)
             obj_norm_factor = self._get_normalization_factor(batch_size, grid_shape, object_mask)
             obj_loss = self._compute_objectness_loss(
-                true_obj, pred_obj, object_mask, ignore_mask, obj_norm_factor
+                true_obj, pred_obj, object_mask, ignore_mask, obj_norm_factor,
+                positive_iou_map=assigned_anchor_iou,
+                max_iou_map=max_iou_map
             )
             total_loss_objectness += obj_loss
             
@@ -420,7 +438,7 @@ class MultiGridLoss:
     def _compute_ignore_mask(self, pred_xy: tf.Tensor, pred_wh: tf.Tensor,
                             true_xy: tf.Tensor, true_wh: tf.Tensor,
                             anchors: np.ndarray, object_mask: tf.Tensor,
-                            y_true_layer: tf.Tensor, grid_shape: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
+                            y_true_layer: tf.Tensor, grid_shape: Tuple[tf.Tensor, tf.Tensor]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Compute ignore mask for objectness and anchor loss.
         Ignore predictions with IoU > ignore_thresh but not assigned as positive.
@@ -446,7 +464,10 @@ class MultiGridLoss:
             grid_shape: Grid shape (grid_h, grid_w)
         
         Returns:
-            Ignore mask [batch, grid_h, grid_w, 1] - 1.0 where cells should be ignored, 0.0 otherwise
+            Tuple:
+              - ignore_mask [batch, grid_h, grid_w, 1]: 1.0 where cells should be ignored
+              - assigned_anchor_iou [batch, grid_h, grid_w, 1]: IoU of the assigned anchor (0 for negatives)
+              - max_iou_map [batch, grid_h, grid_w, 1]: Max IoU over anchors (used for soft suppression)
         """
         batch_size = K.shape(pred_xy)[0]
         grid_h, grid_w = grid_shape
@@ -609,12 +630,21 @@ class MultiGridLoss:
             dtype=tf.float32
         )
         ignore_mask = tf.expand_dims(ignore_mask, axis=-1)  # [batch, grid_h, grid_w, 1]
+
+        # IoU of the assigned anchor (zeroed for empty cells)
+        assigned_anchor_iou = tf.reduce_sum(iou_all * true_anchor_one_hot, axis=-1, keepdims=True)
+        assigned_anchor_iou = assigned_anchor_iou * object_mask
+        assigned_anchor_iou = tf.stop_gradient(assigned_anchor_iou)
+
+        # Max IoU map for soft suppression
+        max_iou_map = tf.expand_dims(max_iou_per_cell, axis=-1)
+        max_iou_map = tf.stop_gradient(max_iou_map)
         
         # Debug: Final shape check
         tf.debugging.assert_equal(tf.shape(ignore_mask), tf.shape(object_mask),
                                 message="Final ignore_mask shape mismatch")
         
-        return ignore_mask
+        return ignore_mask, assigned_anchor_iou, max_iou_map
     
     def _compute_giou_loss(self, true_xy: tf.Tensor, true_wh: tf.Tensor,
                           pred_xy: tf.Tensor, pred_wh: tf.Tensor,
@@ -774,29 +804,48 @@ class MultiGridLoss:
     
     def _compute_objectness_loss(self, true_obj: tf.Tensor, pred_obj: tf.Tensor,
                                 object_mask: tf.Tensor, ignore_mask: Optional[tf.Tensor],
-                                norm_factor: tf.Tensor) -> tf.Tensor:
+                                norm_factor: tf.Tensor,
+                                positive_iou_map: Optional[tf.Tensor] = None,
+                                max_iou_map: Optional[tf.Tensor] = None) -> tf.Tensor:
         """
         Compute objectness loss using BCE with logits.
         
         Objectness predicts if an object exists in a grid cell.
         
         Formula:
-        L_objectness = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale] 
-                       * BCE(true_obj, pred_obj, from_logits=True) / normalization
+        L_objectness = Σ [object_mask * object_scale + (1-object_mask) * (1-ignore_mask) * no_object_scale]
+                       * BCE(target_obj, pred_obj, from_logits=True) / normalization
+        
+        target_obj defaults to binary labels but, when IoU-aware objectness is enabled,
+        follows the predicted IoU (stopped-gradient) to teach the model to down-weight
+        boxes with poor localization — effectively acting as trainable NMS.
         
         Uses from_logits=True for numerical stability (BCE handles sigmoid internally).
         
         This includes:
         - Positive cells (object_mask > 0): weighted by object_scale
         - Negative cells (object_mask == 0 and ignore_mask == 0): weighted by no_object_scale
-        - Ignore cells (ignore_mask > 0): excluded from loss
+        - Ignore cells (ignore_mask > 0): excluded unless trainable_nms_weight > 0, in which case they receive a soft penalty
         """
         if ignore_mask is None:
             ignore_mask = tf.zeros_like(object_mask)
         
+        # Build IoU-aware targets if enabled (acts like trainable, differentiable NMS)
+        obj_target = true_obj
+        if self.use_iou_aware_objectness:
+            if positive_iou_map is None:
+                positive_iou_map = object_mask
+            positive_iou_map = tf.stop_gradient(tf.clip_by_value(positive_iou_map, 0.0, 1.0))
+            iou_target = tf.pow(positive_iou_map + self.eps, self.iou_objectness_power)
+            blended_target = (
+                self.iou_objectness_ratio * iou_target +
+                (1.0 - self.iou_objectness_ratio) * true_obj
+            )
+            obj_target = object_mask * blended_target + (1.0 - object_mask) * obj_target
+        
         # BCE loss on objectness predictions (from_logits=True - feed logits directly to BCE)
         # This is more numerically stable than manually applying sigmoid first
-        objectness_loss = K.binary_crossentropy(true_obj, pred_obj, from_logits=True)
+        objectness_loss = K.binary_crossentropy(obj_target, pred_obj, from_logits=True)
         
         # Weight mask: positive cells get object_scale, negative cells get no_object_scale
         # Ignore cells (ignore_mask > 0) are excluded (weight = 0)
@@ -804,6 +853,14 @@ class MultiGridLoss:
         negative_mask = (1.0 - object_mask) * (1.0 - ignore_mask)  # [batch, grid_h, grid_w, 1]
         negative_weight = negative_mask * self.no_object_scale  # [batch, grid_h, grid_w, 1]
         combined_weight = positive_weight + negative_weight  # [batch, grid_h, grid_w, 1]
+
+        # Optional: softly penalize ignore regions using IoU as a weight (trainable NMS)
+        if self.trainable_nms_weight > 0.0 and max_iou_map is not None:
+            max_iou_map = tf.stop_gradient(tf.clip_by_value(max_iou_map, 0.0, 1.0))
+            suppression_scale = tf.pow(max_iou_map + self.eps, self.trainable_nms_power)
+            soft_ignore_mask = (1.0 - object_mask) * ignore_mask
+            soft_ignore_weight = soft_ignore_mask * self.trainable_nms_weight * suppression_scale
+            combined_weight = combined_weight + soft_ignore_weight
         
         # Apply weight mask
         objectness_loss = objectness_loss * combined_weight

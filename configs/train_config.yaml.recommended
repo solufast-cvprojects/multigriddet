@@ -86,6 +86,11 @@ training:
     no_object_scale: 0.5  # Keep at 0.5 (prevents negative cell dominance)
     class_scale: 1.0      # Keep at 1.0
     anchor_scale: 1.0     # Keep at 1.0 (now decoupled from object_scale after fix)
+    use_iou_aware_objectness: true   # Make objectness track IoU (reduces ghost boxes)
+    iou_objectness_power: 1.5        # Higher power accentuates low-IoU suppression
+    iou_objectness_ratio: 1.0        # 1.0 = pure IoU signal (best for high-quality datasets)
+    trainable_nms_weight: 0.5        # Soft penalty applied to ignore regions (duplicate anchors)
+    trainable_nms_power: 2.0         # Bias suppression towards the most overlapping duplicates
   
   # Loss normalization: ["batch"] keeps pretrained head from being shocked by different scaling
   # Adding "positives" can help when Mosaic injects many objects, but start with ["batch"] only
@@ -156,4 +161,3 @@ output:
   log_dir: logs/training
   model_dir: trained_models
   save_frequency: 1
-
