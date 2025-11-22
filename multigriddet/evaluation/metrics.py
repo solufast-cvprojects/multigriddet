@@ -409,6 +409,50 @@ def get_active_classes(predictions: List[Dict], ground_truths: List[Dict], num_c
     return active_classes
 
 
+def calculate_box_area(bbox: List[float]) -> float:
+    """
+    Calculate area of a bounding box.
+    
+    Args:
+        bbox: Bounding box in xyxy format [x1, y1, x2, y2]
+        
+    Returns:
+        Area in pixels squared
+    """
+    x1, y1, x2, y2 = bbox
+    return (x2 - x1) * (y2 - y1)
+
+
+def filter_by_area(predictions: List[Dict], ground_truths: List[Dict], 
+                   min_area: float = None, max_area: float = None) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Filter predictions and ground truths by bounding box area.
+    
+    Args:
+        predictions: List of prediction dicts with 'bbox' key
+        ground_truths: List of ground truth dicts with 'bbox' key
+        min_area: Minimum area threshold (inclusive)
+        max_area: Maximum area threshold (exclusive)
+        
+    Returns:
+        Tuple of (filtered_predictions, filtered_ground_truths)
+    """
+    filtered_preds = []
+    filtered_gts = []
+    
+    for pred in predictions:
+        area = calculate_box_area(pred['bbox'])
+        if (min_area is None or area >= min_area) and (max_area is None or area < max_area):
+            filtered_preds.append(pred)
+    
+    for gt in ground_truths:
+        area = calculate_box_area(gt['bbox'])
+        if (min_area is None or area >= min_area) and (max_area is None or area < max_area):
+            filtered_gts.append(gt)
+    
+    return filtered_preds, filtered_gts
+
+
 def compute_iou_cache_for_class(predictions: List[Dict], ground_truths: List[Dict], class_id: int) -> Dict[Tuple[int, int], float]:
     """
     Pre-compute IoU matrix for a specific class to avoid recalculation.
@@ -490,7 +534,8 @@ def calculate_map(predictions: List[Dict],
                  method: str = 'coco',
                  use_parallel: bool = True,
                  optimize_classes: bool = True,
-                 cache_ious: bool = True) -> Dict[str, Any]:
+                 cache_ious: bool = True,
+                 compute_per_scale: bool = True) -> Dict[str, Any]:
     """
     Calculate mAP across classes and IoU thresholds.
     
@@ -501,9 +546,22 @@ def calculate_map(predictions: List[Dict],
         iou_thresholds: List of IoU thresholds to evaluate
         class_names: List of class names
         method: Interpolation method ('coco' or 'voc')
+        use_parallel: Whether to use parallel processing
+        optimize_classes: Whether to optimize by processing only active classes
+        cache_ious: Whether to cache IoU computations
+        compute_per_scale: Whether to compute per-scale metrics (APS/APM/APL)
         
     Returns:
-        Dictionary containing mAP results
+        Dictionary containing mAP results with keys:
+        - mAP: mAP@0.5:0.95
+        - mAP50: mAP@0.5
+        - mAP75: mAP@0.75
+        - APS: AP for small objects (area < 32²)
+        - APM: AP for medium objects (32² ≤ area < 96²)
+        - APL: AP for large objects (area ≥ 96²)
+        - APS50, APM50, APL50: AP@0.5 for each scale
+        - per_class: Per-class AP results
+        - per_iou: Per-IoU threshold mAP results
     """
     if iou_thresholds is None:
         # Default COCO thresholds
@@ -619,6 +677,7 @@ def calculate_map(predictions: List[Dict],
                 use_parallel=False,
                 optimize_classes=optimize_classes,
                 cache_ious=False,
+                compute_per_scale=compute_per_scale
             )
     else:
         # Sequential processing (fallback or single class)
@@ -674,6 +733,84 @@ def calculate_map(predictions: List[Dict],
         results['mAP'] = np.mean([results['per_iou'].get(f'mAP{iou:.2f}', 0.0) 
                                  for iou in iou_thresholds])
     
+    # Calculate per-scale metrics (APS/APM/APL) - COCO style
+    # Small: area < 32² = 1024 pixels²
+    # Medium: 32² ≤ area < 96² = 1024 ≤ area < 9216 pixels²
+    # Large: area ≥ 96² = area ≥ 9216 pixels²
+    if compute_per_scale:
+        print("\n   Computing per-scale metrics (APS/APM/APL)...")
+        
+        # Small objects (APS)
+        small_preds, small_gts = filter_by_area(predictions, ground_truths, min_area=None, max_area=1024.0)
+        if len(small_gts) > 0:
+            small_results = calculate_map(
+                predictions=small_preds,
+                ground_truths=small_gts,
+                num_classes=num_classes,
+                iou_thresholds=iou_thresholds,
+                class_names=class_names,
+                method=method,
+                use_parallel=False,  # Disable parallel for nested calls to avoid overhead
+                optimize_classes=optimize_classes,
+                cache_ious=False,  # Disable caching for nested calls
+                compute_per_scale=False  # Prevent recursion
+            )
+            results['APS'] = small_results['mAP']
+            results['APS50'] = small_results.get('mAP50', 0.0)
+        else:
+            results['APS'] = 0.0
+            results['APS50'] = 0.0
+        
+        # Medium objects (APM)
+        medium_preds, medium_gts = filter_by_area(predictions, ground_truths, min_area=1024.0, max_area=9216.0)
+        if len(medium_gts) > 0:
+            medium_results = calculate_map(
+                predictions=medium_preds,
+                ground_truths=medium_gts,
+                num_classes=num_classes,
+                iou_thresholds=iou_thresholds,
+                class_names=class_names,
+                method=method,
+                use_parallel=False,
+                optimize_classes=optimize_classes,
+                cache_ious=False,
+                compute_per_scale=False  # Prevent recursion
+            )
+            results['APM'] = medium_results['mAP']
+            results['APM50'] = medium_results.get('mAP50', 0.0)
+        else:
+            results['APM'] = 0.0
+            results['APM50'] = 0.0
+        
+        # Large objects (APL)
+        large_preds, large_gts = filter_by_area(predictions, ground_truths, min_area=9216.0, max_area=None)
+        if len(large_gts) > 0:
+            large_results = calculate_map(
+                predictions=large_preds,
+                ground_truths=large_gts,
+                num_classes=num_classes,
+                iou_thresholds=iou_thresholds,
+                class_names=class_names,
+                method=method,
+                use_parallel=False,
+                optimize_classes=optimize_classes,
+                cache_ious=False,
+                compute_per_scale=False  # Prevent recursion
+            )
+            results['APL'] = large_results['mAP']
+            results['APL50'] = large_results.get('mAP50', 0.0)
+        else:
+            results['APL'] = 0.0
+            results['APL50'] = 0.0
+    else:
+        # Initialize per-scale metrics to 0.0 when not computing them
+        results['APS'] = 0.0
+        results['APS50'] = 0.0
+        results['APM'] = 0.0
+        results['APM50'] = 0.0
+        results['APL'] = 0.0
+        results['APL50'] = 0.0
+    
     return results
 
 
@@ -693,6 +830,13 @@ def print_map_results(results: Dict[str, Any], top_k: int = 10):
     print(f"   mAP@0.5:0.95: {results['mAP']:.4f}")
     print(f"   mAP@0.5:      {results['mAP50']:.4f}")
     print(f"   mAP@0.75:     {results['mAP75']:.4f}")
+    
+    # Per-scale metrics (APS/APM/APL)
+    if 'APS' in results:
+        print(f"\n📏 Per-Scale Metrics (COCO style):")
+        print(f"   APS (small,  area < 32²):  {results['APS']:.4f} (AP50: {results.get('APS50', 0.0):.4f})")
+        print(f"   APM (medium, 32² ≤ area < 96²): {results['APM']:.4f} (AP50: {results.get('APM50', 0.0):.4f})")
+        print(f"   APL (large,  area ≥ 96²): {results['APL']:.4f} (AP50: {results.get('APL50', 0.0):.4f})")
     
     print(f"\n📈 Per-IoU mAP:")
     for iou, map_val in results['per_iou'].items():
