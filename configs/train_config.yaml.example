@@ -66,7 +66,16 @@ training:
     iou_objectness_ratio: 1.0         # Blend between IoU target (1.0) and binary target (0.0)
     trainable_nms_weight: 0.0         # Extra penalty for ignore regions (0 disables)
     trainable_nms_power: 2.0          # Controls how strongly IoU scales the ignore penalty
-
+    use_consensus_loss: true        # Enable variance-based consensus loss for the 3x3 assignments
+    consensus_kernel_size: 3        # 3x3 cooperation window
+    consensus_iou_power: 1.5        # Higher puts more weight on the best aligned cells
+    consensus_min_iou: 0.001        # Small floor to keep weights stable early in training
+    consensus_coord_scale: 0.5      # Weight for coordinate variance penalty
+    consensus_obj_scale: 0.5        # Weight for objectness variance penalty
+    consensus_class_scale: 0.3      # Weight for classification variance penalty
+    consensus_stop_gradient: true   # Start with stop_gradient for stability, disable later if desired
+    consensus_center_tolerance: 0.0001  # Tolerance for grouping cells that predict the same center
+    
   # Loss normalization strategy
   # Controls how loss values are normalized to ensure stable training and comparable metrics
   # Options (can combine multiple, they multiply together):
