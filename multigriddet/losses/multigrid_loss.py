@@ -61,7 +61,16 @@ class MultiGridLoss:
                  iou_objectness_power: float = 1.0,
                  iou_objectness_ratio: float = 1.0,
                  trainable_nms_weight: float = 0.0,
-                 trainable_nms_power: float = 2.0):
+                 trainable_nms_power: float = 2.0,
+                 use_consensus_loss: bool = False,
+                 consensus_kernel_size: int = 3,
+                 consensus_iou_power: float = 1.5,
+                 consensus_min_iou: float = 1e-3,
+                 consensus_coord_scale: float = 0.5,
+                 consensus_obj_scale: float = 0.5,
+                 consensus_class_scale: float = 0.3,
+                 consensus_stop_gradient: bool = True,
+                 consensus_center_tolerance: float = 1e-4):
         """
         Initialize MultiGridDet loss.
         
@@ -98,6 +107,15 @@ class MultiGridLoss:
             iou_objectness_ratio: Blend factor between IoU target and binary (1.0 = pure IoU, 0.0 = legacy target)
             trainable_nms_weight: Additional weight applied to ignore regions to push duplicates down
             trainable_nms_power: Exponent for scaling the ignore penalty by IoU (higher = focus on high-overlap dupes)
+            use_consensus_loss: Enables variance-based consensus regularization across MultiGrid assignments
+            consensus_kernel_size: Spatial window (odd) used to gather cooperative cells (3 = 3x3 neighborhood)
+            consensus_iou_power: Exponent applied to IoU weights when computing consensus distributions
+            consensus_min_iou: Floor value to keep weights stable when IoU is tiny early in training
+            consensus_coord_scale: Weight applied to the consensus coordinate variance term
+            consensus_obj_scale: Weight applied to the consensus objectness variance term
+            consensus_class_scale: Weight applied to the consensus classification variance term
+            consensus_stop_gradient: If True, stop gradients through consensus targets for stability
+            consensus_center_tolerance: Tolerance when matching cells to the same GT center in grid space
         """
         self.anchors = anchors
         self.num_classes = num_classes
@@ -125,6 +143,15 @@ class MultiGridLoss:
         self.iou_objectness_ratio = float(np.clip(iou_objectness_ratio, 0.0, 1.0))
         self.trainable_nms_weight = float(trainable_nms_weight)
         self.trainable_nms_power = trainable_nms_power
+        self.use_consensus_loss = use_consensus_loss
+        self.consensus_kernel_size = consensus_kernel_size
+        self.consensus_iou_power = consensus_iou_power
+        self.consensus_min_iou = consensus_min_iou
+        self.consensus_coord_scale = consensus_coord_scale
+        self.consensus_obj_scale = consensus_obj_scale
+        self.consensus_class_scale = consensus_class_scale
+        self.consensus_stop_gradient = consensus_stop_gradient
+        self.consensus_center_tolerance = consensus_center_tolerance
         
         # Loss normalization configuration
         if loss_normalization is None:
@@ -144,6 +171,9 @@ class MultiGridLoss:
         
         self.num_layers = len(anchors)
         self.eps = K.epsilon()
+        if self.use_consensus_loss:
+            if self.consensus_kernel_size % 2 == 0 or self.consensus_kernel_size < 1:
+                raise ValueError("consensus_kernel_size must be an odd positive integer")
         
         # Initialize loss components only if needed
         if use_focal_loss:
@@ -236,6 +266,9 @@ class MultiGridLoss:
         total_loss_objectness = 0
         total_loss_classification = 0
         total_loss_anchor = 0
+        total_consensus_coord = 0.0
+        total_consensus_objectness = 0.0
+        total_consensus_class = 0.0
         
         # Process each scale
         for layer_idx in range(self.num_layers):
@@ -375,6 +408,23 @@ class MultiGridLoss:
                 )
             
             total_loss_classification += class_loss
+            
+            if self.use_consensus_loss:
+                consensus_coord_loss, consensus_obj_loss, consensus_class_loss = (
+                    self._compute_variance_consensus_loss(
+                        pred_xy=pred_xy,
+                        pred_wh=pred_wh,
+                        pred_obj=pred_obj,
+                        pred_class=pred_class,
+                        true_xy=true_xy,
+                        object_mask=object_mask,
+                        assigned_anchor_iou=assigned_anchor_iou,
+                        grid_shape=grid_shape
+                    )
+                )
+                total_consensus_coord += consensus_coord_loss
+                total_consensus_objectness += consensus_obj_loss
+                total_consensus_class += consensus_class_loss
         
         # ========== COMBINE ALL LOSSES ==========
         total_loss = (
@@ -383,6 +433,12 @@ class MultiGridLoss:
             self.anchor_scale * total_loss_anchor +
             self.class_scale * total_loss_classification
         )
+        if self.use_consensus_loss:
+            total_loss += (
+                self.consensus_coord_scale * total_consensus_coord +
+                self.consensus_obj_scale * total_consensus_objectness +
+                self.consensus_class_scale * total_consensus_class
+            )
         
         return total_loss
     
@@ -870,6 +926,121 @@ class MultiGridLoss:
         tf.debugging.assert_all_finite(objectness_loss_sum, message="objectness_loss_sum must be finite")
         
         return objectness_loss_sum / norm_factor
+    
+    def _build_grid_coordinates(self, grid_shape: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
+        """Create grid coordinate tensor [1, grid_h, grid_w, 2] for converting to absolute centers."""
+        grid_h, grid_w = grid_shape
+        grid_h_int = tf.cast(grid_h, tf.int32)
+        grid_w_int = tf.cast(grid_w, tf.int32)
+        grid_y = tf.range(grid_h_int, dtype=tf.float32)
+        grid_x = tf.range(grid_w_int, dtype=tf.float32)
+        grid_x_mesh, grid_y_mesh = tf.meshgrid(grid_x, grid_y, indexing='ij')
+        coords = tf.stack([grid_x_mesh, grid_y_mesh], axis=-1)
+        return tf.expand_dims(coords, axis=0)
+    
+    def _compute_center_mask(self, true_xy: tf.Tensor, object_mask: tf.Tensor) -> tf.Tensor:
+        """Identify central grid cells (the ones whose offsets stay within [0,1))."""
+        center_x = tf.logical_and(true_xy[..., 0] >= 0.0, true_xy[..., 0] < 1.0)
+        center_y = tf.logical_and(true_xy[..., 1] >= 0.0, true_xy[..., 1] < 1.0)
+        center_mask = tf.cast(tf.logical_and(center_x, center_y), tf.float32)
+        center_mask = tf.expand_dims(center_mask, axis=-1)
+        return center_mask * object_mask
+    
+    def _extract_local_patches(self, tensor: tf.Tensor) -> tf.Tensor:
+        """Extract consensus neighborhoods using tf.image.extract_patches."""
+        k = self.consensus_kernel_size
+        patches = tf.image.extract_patches(
+            images=tensor,
+            sizes=[1, k, k, 1],
+            strides=[1, 1, 1, 1],
+            rates=[1, 1, 1, 1],
+            padding='SAME'
+        )
+        tensor_shape = tf.shape(tensor)
+        patch_area = k * k
+        return tf.reshape(
+            patches,
+            [tensor_shape[0], tensor_shape[1], tensor_shape[2], patch_area, tensor_shape[3]]
+        )
+    
+    def _compute_variance_consensus_loss(self,
+                                         pred_xy: tf.Tensor,
+                                         pred_wh: tf.Tensor,
+                                         pred_obj: tf.Tensor,
+                                         pred_class: tf.Tensor,
+                                         true_xy: tf.Tensor,
+                                         object_mask: tf.Tensor,
+                                         assigned_anchor_iou: tf.Tensor,
+                                         grid_shape: Tuple[tf.Tensor, tf.Tensor]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """
+        Compute variance-based consensus losses for coordinates, objectness, and classes.
+        """
+        center_mask = self._compute_center_mask(true_xy, object_mask)
+        grid_coords = self._build_grid_coordinates(grid_shape)
+        true_centers = true_xy + grid_coords  # [batch, grid_h, grid_w, 2]
+        
+        # Gather patches for masks, IoU weights, and center coordinates
+        mask_patches = self._extract_local_patches(object_mask)
+        iou_patches = self._extract_local_patches(assigned_anchor_iou)
+        center_patches = self._extract_local_patches(true_centers)
+        
+        # Identify cells that share the same decoded center as the central cell
+        center_ref = tf.expand_dims(true_centers, axis=3)  # [batch, grid_h, grid_w, 1, 2]
+        center_diff = tf.abs(center_patches - center_ref)
+        same_center = tf.cast(
+            tf.reduce_max(center_diff, axis=-1, keepdims=True) < self.consensus_center_tolerance,
+            tf.float32
+        )
+        
+        group_mask = mask_patches * same_center
+        group_mask = group_mask * tf.expand_dims(center_mask, axis=3)
+        
+        # IoU-based weighting with minimum floor
+        valid_weights = tf.where(
+            group_mask > 0.0,
+            tf.maximum(iou_patches, self.consensus_min_iou),
+            tf.zeros_like(iou_patches)
+        )
+        raw_weights = tf.pow(valid_weights, self.consensus_iou_power) * group_mask
+        weight_sum = tf.reduce_sum(raw_weights, axis=3, keepdims=True) + self.eps
+        weights = raw_weights / weight_sum
+        weights_scalar = tf.squeeze(weights, axis=-1)
+        
+        normalizer = K.maximum(tf.reduce_sum(center_mask), 1.0)
+        
+        # Coordinate consensus (xy + wh stacked)
+        pred_box = tf.concat([pred_xy, pred_wh], axis=-1)
+        box_patches = self._extract_local_patches(pred_box)
+        box_consensus = tf.reduce_sum(weights * box_patches, axis=3)
+        if self.consensus_stop_gradient:
+            box_consensus = tf.stop_gradient(box_consensus)
+        box_diff = box_patches - tf.expand_dims(box_consensus, axis=3)
+        box_diff_sq = tf.reduce_sum(tf.square(box_diff), axis=-1)
+        coord_variance = tf.reduce_sum(weights_scalar * box_diff_sq) / normalizer
+        
+        # Objectness consensus (operate on sigmoid probabilities)
+        obj_probs = tf.nn.sigmoid(pred_obj)
+        obj_patches = self._extract_local_patches(obj_probs)
+        obj_consensus = tf.reduce_sum(weights * obj_patches, axis=3)
+        if self.consensus_stop_gradient:
+            obj_consensus = tf.stop_gradient(obj_consensus)
+        obj_diff = obj_patches - tf.expand_dims(obj_consensus, axis=3)
+        obj_diff_sq = tf.square(obj_diff)
+        obj_variance = tf.reduce_sum(weights_scalar * tf.squeeze(obj_diff_sq, axis=-1)) / normalizer
+        
+        # Classification consensus (use sigmoid probs for BCE-style heads)
+        class_probs = tf.nn.sigmoid(pred_class)
+        class_patches = self._extract_local_patches(class_probs)
+        class_consensus = tf.reduce_sum(weights * class_patches, axis=3)
+        if self.consensus_stop_gradient:
+            class_consensus = tf.stop_gradient(class_consensus)
+        class_diff = class_patches - tf.expand_dims(class_consensus, axis=3)
+        class_diff_sq = tf.square(class_diff)
+        class_weights = tf.expand_dims(weights_scalar, axis=-1)
+        class_variance = tf.reduce_sum(class_weights * class_diff_sq)
+        class_variance = class_variance / (normalizer * tf.cast(self.num_classes, tf.float32))
+        
+        return coord_variance, obj_variance, class_variance
 
 
 def multigriddet_loss(args, anchors, num_classes, **kwargs):

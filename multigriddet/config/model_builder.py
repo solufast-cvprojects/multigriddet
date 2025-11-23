@@ -134,6 +134,15 @@ def build_model_from_config(config: Dict[str, Any], for_training: bool = False, 
                     'iou_objectness_ratio': loss_config.get('iou_objectness_ratio', 1.0),
                     'trainable_nms_weight': loss_config.get('trainable_nms_weight', 0.0),
                     'trainable_nms_power': loss_config.get('trainable_nms_power', 2.0),
+                    'use_consensus_loss': loss_config.get('use_consensus_loss', False),
+                    'consensus_kernel_size': loss_config.get('consensus_kernel_size', 3),
+                    'consensus_iou_power': loss_config.get('consensus_iou_power', 1.5),
+                    'consensus_min_iou': loss_config.get('consensus_min_iou', 1e-3),
+                    'consensus_coord_scale': loss_config.get('consensus_coord_scale', 0.5),
+                    'consensus_obj_scale': loss_config.get('consensus_obj_scale', 0.5),
+                    'consensus_class_scale': loss_config.get('consensus_class_scale', 0.3),
+                    'consensus_stop_gradient': loss_config.get('consensus_stop_gradient', True),
+                    'consensus_center_tolerance': loss_config.get('consensus_center_tolerance', 1e-4),
                 }
             
             # Extract loss normalization configuration
