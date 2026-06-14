@@ -7,7 +7,7 @@ model:
     architecture: multigriddet_darknet
     num_classes: 80
     input_shape: [608, 608, 3]  # Base input shape - multi-scale handled by data generator
-    anchors_path: configs/yolov3_coco_anchor.txt
+    anchors_path: configs/coco_custom_anchors.txt
     classes_path: configs/coco_classes.txt
   
   # Custom mode (advanced, for future use)

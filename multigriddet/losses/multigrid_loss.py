@@ -1064,8 +1064,12 @@ class MultiGridLoss:
         
         normalizer = K.maximum(tf.reduce_sum(center_mask), 1.0)
         
-        # Coordinate consensus (xy + wh stacked)
-        pred_box = tf.concat([pred_xy, pred_wh], axis=-1)
+        # Coordinate consensus uses decoded grid-space centers. Neighboring
+        # MultiGrid cells assigned to the same object should not agree on local
+        # offsets; they should agree on the same absolute center.
+        pred_xy_activated = self._activate_xy(pred_xy)
+        pred_abs_xy = pred_xy_activated + grid_coords
+        pred_box = tf.concat([pred_abs_xy, pred_wh], axis=-1)
         box_patches = self._extract_local_patches(pred_box)
         box_consensus = tf.reduce_sum(weights * box_patches, axis=3)
         if self.consensus_stop_gradient:
@@ -1084,8 +1088,12 @@ class MultiGridLoss:
         obj_diff_sq = tf.square(obj_diff)
         obj_variance = tf.reduce_sum(weights_scalar * tf.squeeze(obj_diff_sq, axis=-1)) / normalizer
         
-        # Classification consensus (use sigmoid probs for BCE-style heads)
-        class_probs = tf.nn.sigmoid(pred_class)
+        # Classification consensus should operate in the same probability space
+        # as the configured class loss.
+        if self.use_softmax_loss:
+            class_probs = tf.nn.softmax(pred_class, axis=-1)
+        else:
+            class_probs = tf.nn.sigmoid(pred_class)
         class_patches = self._extract_local_patches(class_probs)
         class_consensus = tf.reduce_sum(weights * class_patches, axis=3)
         if self.consensus_stop_gradient:
